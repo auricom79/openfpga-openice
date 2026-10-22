@@ -1,0 +1,9 @@
+# Preserve the exact source snapshot and vendor line endings across platforms.
+src/** -text
+quartus/** -text
+licenses/** -text
+*.rbf_r binary
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf

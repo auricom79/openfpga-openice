@@ -1,0 +1,46 @@
+{
+  "data": {
+    "magic": "APF_VER_1",
+    "data_slots": [
+      {
+        "name": "Program",
+        "id": 0,
+        "required": true,
+        "parameters": 8,
+        "deferload": true,
+        "filename": "openice-program.bin",
+        "extensions": [
+          "bin"
+        ],
+        "size_exact": 1048576,
+        "address": "0x10000000"
+      },
+      {
+        "name": "Graphics",
+        "id": 1,
+        "required": true,
+        "parameters": 8,
+        "deferload": true,
+        "filename": "openice-graphics.bin",
+        "extensions": [
+          "bin"
+        ],
+        "size_exact": 16777216,
+        "address": "0x10000000"
+      },
+      {
+        "name": "DCS Sound",
+        "id": 2,
+        "required": true,
+        "parameters": 8,
+        "deferload": true,
+        "filename": "openice-sound.bin",
+        "extensions": [
+          "bin"
+        ],
+        "size_exact": 4194304,
+        "address": "0x10000000"
+      }
+    ]
+  }
+}

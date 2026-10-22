@@ -1,0 +1,167 @@
+{
+  "game": "NHL Open Ice - 2 on 2 Challenge",
+  "revision": "1.21",
+  "romset": "openice",
+  "roms": {
+    "open_ice_l1.2.u2": {
+      "size": 1048576,
+      "crc32": "8adb5aab",
+      "sha1": "4c25bc051c90947f3366f83ac5ca8dc78e26b8a4"
+    },
+    "open_ice_l1.u3": {
+      "size": 1048576,
+      "crc32": "11c61ad6",
+      "sha1": "324621d6b486399b6d5ede1fed39d4e448cdeb32"
+    },
+    "open_ice_l1.u4": {
+      "size": 1048576,
+      "crc32": "04279290",
+      "sha1": "daf1e57137ae1c3434194054e69809bfe3ed1fc3"
+    },
+    "open_ice_l1.u5": {
+      "size": 1048576,
+      "crc32": "e90ad61f",
+      "sha1": "59eeabcae7e0e70cdb4472cde64b8a28b07ede98"
+    },
+    "open_ice_l1.21.u54": {
+      "size": 524288,
+      "crc32": "e4225284",
+      "sha1": "d5e267cf35826c106bb0a800363849ed4d489e56"
+    },
+    "open_ice_l1.21.u63": {
+      "size": 524288,
+      "crc32": "97d308a3",
+      "sha1": "0a517fab77bc2277884587c7e29e392bb360d27b"
+    },
+    "open_ice_l1.2.u133": {
+      "size": 1048576,
+      "crc32": "8a81605c",
+      "sha1": "cf397b8da242566b21579b90528857ccd2f93141"
+    },
+    "open_ice_l1.2.u132": {
+      "size": 1048576,
+      "crc32": "cfdd6702",
+      "sha1": "0198d2cc2de93a8aa345ba0af8d92713d798be8a"
+    },
+    "open_ice_l1.2.u131": {
+      "size": 1048576,
+      "crc32": "cc428eb7",
+      "sha1": "ff2403077453f24bd1b176f57b17649b1b64bccf"
+    },
+    "open_ice_l1.2.u130": {
+      "size": 1048576,
+      "crc32": "74c2d50c",
+      "sha1": "7880a28b003aa44878384efcb72b98833383f67e"
+    },
+    "open_ice_l1.2.u129": {
+      "size": 1048576,
+      "crc32": "9e2ff012",
+      "sha1": "35160ab239f0d8efcb2dc67dee4bd8d204226e3d"
+    },
+    "open_ice_l1.2.u128": {
+      "size": 1048576,
+      "crc32": "35d2e610",
+      "sha1": "c4bd18f44592299f120344ecaf1464a8b31d80c8"
+    },
+    "open_ice_l1.2.u127": {
+      "size": 1048576,
+      "crc32": "bcbf19fe",
+      "sha1": "e28f0238ef020b75b10318e5c3dd4c5472b3638a"
+    },
+    "open_ice_l1.2.u126": {
+      "size": 1048576,
+      "crc32": "8e3106ae",
+      "sha1": "58d1fd097e23578195d28671f22cfa3ed161c0f5"
+    },
+    "open_ice_l1.u125": {
+      "size": 1048576,
+      "crc32": "a7b54550",
+      "sha1": "83e3627c4e84466ec10023b0e2259ad86b791fd7"
+    },
+    "open_ice_l1.u124": {
+      "size": 1048576,
+      "crc32": "7c02cb50",
+      "sha1": "92d24bcfd66396c52c823b816118eed39c4ef9cd"
+    },
+    "open_ice_l1.u123": {
+      "size": 1048576,
+      "crc32": "d543bd9d",
+      "sha1": "a9ff8589fe185ea058b549c2ed4e71f6c50e9638"
+    },
+    "open_ice_l1.u122": {
+      "size": 1048576,
+      "crc32": "3744d291",
+      "sha1": "e4484f377a66c4c64b015ef461419d956b6e23e4"
+    },
+    "open_ice_l1.2.u121": {
+      "size": 1048576,
+      "crc32": "acd2f7c7",
+      "sha1": "82d6f09e63a825b118c36d668427011cd8892eaa"
+    },
+    "open_ice_l1.2.u120": {
+      "size": 1048576,
+      "crc32": "4295686a",
+      "sha1": "2522e57335bb8cca6d76942d2fd62560f88e37a6"
+    },
+    "open_ice_l1.2.u119": {
+      "size": 1048576,
+      "crc32": "948b9b27",
+      "sha1": "62d031410f491d557e27ba055d3db9d36d5a153c"
+    },
+    "open_ice_l1.2.u118": {
+      "size": 1048576,
+      "crc32": "9eaaf93e",
+      "sha1": "56bd881df5282f659ac68ace960a3b085c13dd9d"
+    }
+  },
+  "streams": [
+    {
+      "filename": "openice-program.bin",
+      "parts": [
+        "open_ice_l1.21.u54",
+        "open_ice_l1.21.u63"
+      ],
+      "size": 1048576,
+      "sha256": "169092c33db496db1c8e2de2e0c3b4fcdc0f96ae4605412ef37a929ad5bde1e4"
+    },
+    {
+      "filename": "openice-graphics.bin",
+      "parts": [
+        "open_ice_l1.2.u133",
+        "open_ice_l1.2.u132",
+        "open_ice_l1.2.u131",
+        "open_ice_l1.2.u130",
+        "open_ice_l1.2.u129",
+        "open_ice_l1.2.u128",
+        "open_ice_l1.2.u127",
+        "open_ice_l1.2.u126",
+        "open_ice_l1.u125",
+        "open_ice_l1.u124",
+        "open_ice_l1.u123",
+        "open_ice_l1.u122",
+        "open_ice_l1.2.u121",
+        "open_ice_l1.2.u120",
+        "open_ice_l1.2.u119",
+        "open_ice_l1.2.u118"
+      ],
+      "size": 16777216,
+      "sha256": "4be974112ed6b4ff516f0d1b87a490281b49ff5169ffc891f477dc94f5eb3310"
+    },
+    {
+      "filename": "openice-sound.bin",
+      "parts": [
+        "open_ice_l1.2.u2",
+        "open_ice_l1.u3",
+        "open_ice_l1.u4",
+        "open_ice_l1.u5"
+      ],
+      "size": 4194304,
+      "sha256": "8735b8dea961c77138a1dc4efab118d49aa5efe03b9c90d2eb77cb911be23396"
+    }
+  ],
+  "reference": "https://github.com/mamedev/mame/blob/master/src/mame/williams/midwunit.cpp",
+  "layout_source": {
+    "url": "https://github.com/blahm1d/wolf-unit.git",
+    "commit": "acf7fe7d08c838e36f8dd2cf1eae657454fa6b11"
+  }
+}

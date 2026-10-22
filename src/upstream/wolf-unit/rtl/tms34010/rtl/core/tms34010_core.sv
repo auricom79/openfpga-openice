@@ -1,0 +1,3938 @@
+// -----------------------------------------------------------------------------
+// tms34010_core.sv
+//
+// Top-level TMS34010 core wrapper. Phase 3 — decode skeleton integrated.
+//
+// What this module IS, today:
+//   - A clocked top-level entity with explicit synchronous active-high reset.
+//   - A typed-enum core FSM that fully cycles: CORE_RESET → CORE_FETCH →
+//     CORE_DECODE → CORE_EXECUTE → CORE_WRITEBACK → CORE_FETCH (no
+//     instruction touches memory in Phase 3, so CORE_MEMORY is unused).
+//   - Memory IF that drives `mem_addr` from the PC register and asserts a
+//     16-bit fetch in CORE_FETCH. On mem_ack the fetched word is latched
+//     into `instr_word_q` and the PC advances by INSTR_WORD_BITS.
+//   - A tms34010_decode instance evaluates `instr_word_q` combinationally.
+//     Phase 3 skeleton: every encoding is flagged ILLEGAL.
+//   - Sticky `illegal_opcode_o` observability output.
+//   - Register file, ALU, and status register instantiated and connected
+//     into the datapath: ALU result → regfile write-data port, ALU flags
+//     → status-register flag-update port. All "go" signals (rf_wr_en,
+//     st_flag_update_en, st_write_en) are currently tied to 0 — no
+//     instruction is yet decoded into a real datapath action. Task 0012
+//     replaces these tie-offs with decoded-instruction-driven values for
+//     the first real instruction (MOVI).
+//
+// What this module IS NOT, yet:
+//   - No real instruction decoded. EXECUTE / WRITEBACK are pass-through
+//     states; the datapath stays at quiescent values.
+//   - No branches / jumps yet, so the PC `load_en` port is tied 0.
+//   - The PC starts at `RESET_PC` from the package, currently a placeholder
+//     '0 — see docs/assumptions.md A0008 for the architectural reset-vector
+//     fetch sequence that is Phase 8 work.
+//
+// Synthesis notes:
+//   - One sequential `always_ff` for the state register.
+//   - One `always_comb` for next-state and combinational outputs, with safe
+//     defaults at the top to prevent latch inference.
+//   - No `/`, `%`, runtime loops, or `initial` blocks.
+//   - Reset is synchronous active-high (project convention A0003).
+//
+// Spec source: third_party/TMS34010_Info/docs/ti-official/
+//              1988_TI_TMS34010_Users_Guide.pdf
+// -----------------------------------------------------------------------------
+
+`default_nettype none
+module tms34010_core
+  import tms34010_pkg::*;
+#(
+`ifdef POCKET
+  parameter bit SHARED_XY_ARITH = 1'b1,
+  parameter bit SHARED_WINDOW = 1'b1,
+  parameter bit SHARED_ADDRESS = 1'b1,
+  parameter bit SHARED_PIXEL = 1'b1,
+  parameter bit SHARED_XY = 1'b1,
+  parameter bit SHARED_GRAPHICS_REGS = 1'b1,
+  parameter bit MLAB_REGFILE = 1'b1,
+  parameter bit IO_CPU_CE = 1'b1,
+  parameter bit LOCAL_IO_WRITE = 1'b0 // local bit enables cost more ALMs on Cyclone V
+`else
+  parameter bit SHARED_XY_ARITH = 1'b0,
+  parameter bit SHARED_WINDOW = 1'b0,
+  parameter bit SHARED_ADDRESS = 1'b0,
+  parameter bit SHARED_PIXEL = 1'b0,
+  parameter bit SHARED_XY = 1'b0,
+  parameter bit SHARED_GRAPHICS_REGS = 1'b0,
+  parameter bit MLAB_REGFILE = 1'b0,
+  parameter bit IO_CPU_CE = 1'b0,
+  parameter bit LOCAL_IO_WRITE = 1'b0
+`endif
+)(
+  input  wire logic                                clk,
+  input  wire logic                                ce_cpu,   // P0019 (Y-unit): CPU clock-enable. Runs the
+                                                        // core on clk_sys gated /4 instead of a separate
+                                                        // async clk_cpu PLL tap, eliminating the CPU<->
+                                                        // memsys CDC (the HW-only "works in sim" bug).
+                                                        // Tie high in legacy TBs to keep full-rate behavior.
+  input  wire logic                                ce_pix,   // P00xx: pixel-clock enable for the video-timing
+                                                        // counters (io_regs.u_video) -> HCOUNT/dot,
+                                                        // VCOUNT/line, DPYINT/frame at the DOT rate (not
+                                                        // the core clock). UNCONNECTED in legacy TBs ->
+                                                        // io_regs/u_video default to full rate (their own
+                                                        // ce === 1'b0 guard), so those TBs are unaffected.
+  input  wire logic                                rst,
+
+  // Memory request/valid interface (stub in Phase 0 skeleton).
+  output logic                                mem_req,
+  output logic                                mem_we,
+  output logic [ADDR_WIDTH-1:0]               mem_addr,
+  output logic [FIELD_SIZE_WIDTH-1:0]         mem_size,
+  output logic [DATA_WIDTH-1:0]               mem_wdata,
+  // SRT sideband (VRAM shift-register-transfer, 1988 UG p114; MAME 0.280
+  // tms34010.cpp:937-967 set_pixel_function + 34010gfx.hxx:223-230 shiftreg_w).
+  // Asserted WITH mem_req when DPYCTL.SRT=1 converts a graphics PIXEL access:
+  //   mem_srt && !mem_we  = "latch row": the memory system copies 512
+  //     consecutive 16-bit words starting at word index (mem_addr >> 4) into
+  //     an internal row buffer and returns the FIRST latched word as rdata
+  //     (MAME read_pixel_shiftreg returns m_shiftreg[0]).
+  //   mem_srt &&  mem_we  = "row transfer": the memory system copies the row
+  //     buffer to 512 words at word index (mem_addr >> 4); the write DATA is
+  //     DISCARDED (gospel: shiftreg_w ignores its data operand).
+  // Raw addresses, >>4, no extra row alignment (midtunit_v.cpp:330-339 uses
+  // the raw address). Both ack like normal ops (the core blocks on ack).
+  // Ordinary MOVE/field accesses and instruction fetches NEVER assert this
+  // (gospel: only pixel ops are rerouted).
+  output logic                                mem_srt,
+  input  wire logic [DATA_WIDTH-1:0]               mem_rdata,
+  input  wire logic                                mem_ack,
+
+  // Observability for testbenches (Phase 0..3 — may move to an
+  // sva/observability bundle later).
+  output wire core_state_t                         state_o,
+  output logic [ADDR_WIDTH-1:0]               pc_o,
+  output wire instr_word_t                         instr_word_o,
+  output logic                                illegal_opcode_o,
+  output logic [15:0]                         dpystrt_o,   // P0024: DPYSTRT tap (display double-buffer)
+  output logic [15:0]                         dpyadr_o,    // live DPYADR page, including software override
+  output logic                                vblank_start_o, // exact DPYADR<-DPYSTRT frame boundary
+
+  // Phase 2B: dynamic display geometry (video timing registers for runtime adaptation)
+  output logic [15:0]                         heblnk_o,    // Horizontal end of blanking
+  output logic [15:0]                         hsblnk_o,    // Horizontal start of blanking
+  output logic [15:0]                         veblnk_o,    // Vertical end of blanking
+  output logic [15:0]                         vsblnk_o,    // Vertical start of blanking
+
+  // P0016: external interrupt pin LINT1 (level; e.g. Y-unit DMA-done). Mirrored
+  // into INTPEND.X1P by the io_regs block. X/Z-safe there, so legacy TBs that
+  // leave this port unconnected keep working (unconnected == not asserted).
+  input  wire logic                                lint1_in
+);
+
+  // ===== P0002 (Arcade-SmashTV): forward declarations hoisted for Questa FSE 25.1std
+  // (2025.2), which enforces declaration-before-use. Pure decls moved verbatim from
+  // below; behavior-neutral (SV module items are order-independent). See PATCHES.md.
+  logic                  pblt_w2_q;        // W=2 (miss detection) active
+  logic pblt_w1_q, pblt_array_hit;
+  logic [1:0]            drav_w_q;          // CONTROL.W latched at EXECUTE
+  logic                  drav_inside_q;     // Rd's pixel lies inside the window
+  logic                  line_last_inside_q;  // inside status of the last pixel
+  logic                  line_aborted_q;      // W=1/W=2 aborted on a violation
+  logic                  line_win_en;         // any window mode active (W!=0)
+  logic [DATA_WIDTH-1:0]  rf_rs1_data;
+  logic [DATA_WIDTH-1:0]  rf_rs2_data;
+  logic [DATA_WIDTH-1:0]  rf_rs3_data;
+  logic is_fill, fill_is_xy, is_pblt;
+  logic is_drav;
+  logic is_line;
+  logic                  pixt_rmw;
+  logic [DATA_WIDTH-1:0] pix_dest_q;     // dest pixel latched at the read step
+  logic                  pixt_xy_win;
+  logic                  pixt_inside_q;     // latched at the RMW write step
+  logic [4:0]            pix_xy_xsh;
+  logic [DATA_WIDTH-1:0] pix_xy_dst_linear;
+  logic                  is_mpy, mpy_signed, mpy_rd_even;
+  logic                  is_div, is_divu, is_modu, is_divs, is_mods;
+  logic div_signed_ovf, div_v;
+  logic is_pair_wb, pair_second_pass, pair_wb_step;
+  logic [15:0]           io_psize;     // PSIZE register (pixel size, for PIXT/CVXYL)
+  logic [15:0]           io_convdp;    // CONVDP register (XY->linear dest pitch)
+  logic [15:0]           io_convsp;    // CONVSP register (XY->linear source pitch)
+  logic [15:0]           io_control;   // CONTROL register (PPOP, T, window mode, ...)
+  logic [15:0]           io_pmask;     // PMASK register (plane mask)
+  logic                  wvp_set;      // pulse to set INTPEND.WV on a window violation
+  logic [DATA_WIDTH-1:0] mem_rdata_eff;
+  // Read-address selection is independent of whether FETCH is suppressed by an
+  // interrupt. Only mem_req starts a transaction. Keeping the inactive FETCH
+  // address defined avoids routing a live IRQ through the unrelated I/O read
+  // mux and memory-result datapath.
+  logic mem_read_active;
+  logic                  int_push_q;
+
+
+  // ---------------------------------------------------------------------------
+  // Pixel-processing operation (PPOP) — shared by the PIXT store engine and
+  // the graphics fill/blt engines. Returns f(src, dest) per the CONTROL.PPOP
+  // code (SPVU001A): 16 Boolean ops (bitwise) + 6 arithmetic ops (on the
+  // unsigned PSIZE-bit pixels masked by `fmask`; ADDS/SUBS saturate). The low
+  // `fmask` bits of the result are what the caller writes.
+  // ---------------------------------------------------------------------------
+  function automatic logic [DATA_WIDTH-1:0] ppop_apply(
+      input logic [DATA_WIDTH-1:0] src,
+      input logic [DATA_WIDTH-1:0] dest,
+      input logic [4:0]            ppop,
+      input logic [DATA_WIDTH-1:0] fmask);
+    logic [DATA_WIDTH-1:0] sp, dp, addsum;
+    sp     = src  & fmask;
+    dp     = dest & fmask;
+    addsum = dp + sp;
+    unique case (ppop)
+      5'h00:   ppop_apply = src;               // S (replace)
+      5'h01:   ppop_apply = src &  dest;       // S AND D
+      5'h02:   ppop_apply = src & ~dest;       // S AND ~D
+      5'h03:   ppop_apply = '0;                // 0
+      5'h04:   ppop_apply = src | ~dest;       // S OR ~D
+      5'h05:   ppop_apply = ~(src ^ dest);     // S XNOR D
+      5'h06:   ppop_apply = ~dest;             // ~D
+      5'h07:   ppop_apply = ~(src | dest);     // S NOR D
+      5'h08:   ppop_apply = src |  dest;       // S OR D
+      5'h09:   ppop_apply = dest;              // D (no change)
+      5'h0A:   ppop_apply = src ^  dest;       // S XOR D
+      5'h0B:   ppop_apply = ~src & dest;       // ~S AND D
+      5'h0C:   ppop_apply = '1;                // 1
+      5'h0D:   ppop_apply = ~src | dest;       // ~S OR D
+      5'h0E:   ppop_apply = ~(src & dest);     // S NAND D
+      5'h0F:   ppop_apply = ~src;              // ~S
+      5'h10:   ppop_apply = addsum;            // D + S (wrap)
+      5'h11:   ppop_apply = (addsum > fmask) ? fmask : addsum;       // ADDS (sat all-1s)
+      5'h12:   ppop_apply = dp - sp;           // D - S (wrap)
+      5'h13:   ppop_apply = (dp >= sp) ? (dp - sp) : '0;             // SUBS (sat 0)
+      5'h14:   ppop_apply = (dp >= sp) ? dp : sp;                    // MAX(D,S)
+      5'h15:   ppop_apply = (dp <= sp) ? dp : sp;                    // MIN(D,S)
+      default: ppop_apply = src;               // 0x16-0x1F reserved -> replace
+    endcase
+  endfunction
+
+  // ---------------------------------------------------------------------------
+  // Program counter
+  // ---------------------------------------------------------------------------
+  logic                  pc_advance_en;
+  logic                  pc_load_en;
+  logic [ADDR_WIDTH-1:0] pc_load_value;
+  logic [ADDR_WIDTH-1:0] pc_value;
+
+  tms34010_pc u_pc (
+    .clk            (clk),
+    .ce_cpu         (ce_cpu),
+    .rst            (rst),
+    .load_en        (pc_load_en),
+    .load_value     (pc_load_value),
+    .advance_en     (pc_advance_en),
+    .advance_amount (PC_ADVANCE_WIDTH'(INSTR_WORD_BITS)),
+    .pc_o           (pc_value)
+  );
+
+  // ---------------------------------------------------------------------------
+  // State register
+  // ---------------------------------------------------------------------------
+  core_state_t state_q;
+  core_state_t state_d;
+
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      state_q <= CORE_RESET;
+    end else begin
+      state_q <= state_d;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // Instruction word latch + decoder
+  //
+  // instr_word_q is latched the cycle the memory acks an instruction
+  // fetch. The decoder runs combinationally; consumers see the decoded
+  // result from CORE_DECODE onward.
+  // ---------------------------------------------------------------------------
+  instr_word_t    instr_word_q;
+  decoded_instr_t decoded;
+
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      instr_word_q <= '0;
+    end else if (state_q == CORE_FETCH && mem_ack) begin
+      instr_word_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
+    end
+  end
+
+  tms34010_decode u_decode (
+    .instr  (instr_word_q),
+    .decoded(decoded)
+  );
+
+  // Sticky illegal-opcode latch. Set on the cycle we are in CORE_DECODE
+  // with an illegal `decoded`. Cleared only by reset.
+  logic illegal_q;
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      illegal_q <= 1'b0;
+    end else if (state_q == CORE_DECODE && decoded.illegal) begin
+      illegal_q <= 1'b1;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // Branch-target computation (PC-relative, short form)
+  //
+  // For JRUC short and (future) JRcc short: the displacement in
+  // instr_word_q[7:0] is a signed 8-bit count of 16-bit words. The new PC
+  // is `current_pc + disp * 16` (in bits). `current_pc` is the value AFTER
+  // the opcode fetch already advanced the PC by 16, which matches what
+  // hand-decoding `JRGT L5 = 0xC70B` at PC=0x3B0 → target 0x470 produces
+  // (target = (0x3B0+16) + 11*16 = 0x470).
+  //
+  // The full target is computed combinationally and only consumed when
+  // the FSM is in CORE_WRITEBACK with a taken-branch decoded class.
+  // ---------------------------------------------------------------------------
+  logic [ADDR_WIDTH-1:0] shared_address_sum;
+  logic [ADDR_WIDTH-1:0] branch_target_short;
+  logic signed [INSTR_WORD_WIDTH-1:0] disp_signed_12;
+  // {disp8, 4'h0} = disp * 16 expressed in 12 bits, sign-bit at [11].
+  assign disp_signed_12   = $signed({instr_word_q[7:0], 4'h0});
+  assign branch_target_short = SHARED_ADDRESS ? shared_address_sum : pc_value + ADDR_WIDTH'(disp_signed_12);
+
+  // Immediate latches — declared up here (before their first use in
+  // the branch_target_long / branch_target_jacc combinational
+  // computations below) because Questa is strict about forward
+  // references in `assign` statements, even though Verilator hoists
+  // them. The matching `always_ff` that actually latches imm_lo_q /
+  // imm_hi_q on memory acks lives further down (search for
+  // CORE_FETCH_IMM_LO / CORE_FETCH_IMM_HI).
+  instr_word_t imm_lo_q;
+  instr_word_t imm_hi_q;
+  // P0014: second 32-bit immediate (the DAddr of MOVE @SAddr,@DAddr). SAddr
+  // reuses imm_lo_q/imm_hi_q; DAddr is fetched into these after it.
+  instr_word_t imm2_lo_q;
+  instr_word_t imm2_hi_q;
+  wire [DATA_WIDTH-1:0] imm2_32 = {imm2_hi_q, imm2_lo_q};
+  wire is_mv_abs_m2m = (decoded.iclass == INSTR_MOVE_ABS_M2M);
+  // P0015: MOVE *Rs(SOff),*Rd(DOff) — the second immediate is a SIGNED 16-bit
+  // bit-displacement (imm2_lo only; no HI word is fetched for this form).
+  wire is_mv_off_m2m = (decoded.iclass == INSTR_MOVE_OFF_M2M);
+  wire [DATA_WIDTH-1:0] imm2_off_sext =
+      {{(DATA_WIDTH-INSTR_WORD_WIDTH){imm2_lo_q[INSTR_WORD_WIDTH-1]}}, imm2_lo_q};
+
+  // Long-form JRcc target: PC_after_both_fetches + sign_extend(disp16) × 16.
+  // By the time the FSM hits CORE_WRITEBACK, pc_value already equals
+  // (PC_original + 32 bits) — the opcode FETCH and the IMM_LO FETCH each
+  // advanced the PC by 16. `imm_lo_q` holds the 16-bit displacement word.
+  // {disp16, 4'h0} is a 20-bit value; sign bit at [19] equals imm_lo_q[15].
+  logic [ADDR_WIDTH-1:0]   branch_target_long;
+  logic signed [19:0]      disp_signed_20;
+  assign disp_signed_20   = $signed({imm_lo_q, 4'h0});
+  assign branch_target_long = SHARED_ADDRESS ? shared_address_sum : pc_value + ADDR_WIDTH'(disp_signed_20);
+
+  // JAcc absolute target: PC ← address with the bottom 4 bits forced to 0
+  // (spec page 12-91 explicitly: "lower four bits of the program counter
+  // are set to 0"). Address is assembled from the two 16-bit imm words
+  // already fetched via needs_imm32, same as MOVI IL.
+  logic [ADDR_WIDTH-1:0] branch_target_jacc;
+  assign branch_target_jacc = {imm_hi_q, imm_lo_q[INSTR_WORD_WIDTH-1:4], 4'h0};
+
+  // DSJS short-form target: PC' ± offset×16 bits.
+  // pc_value at CORE_WRITEBACK already equals PC' (= PC_original + 16
+  // after the single-word opcode fetch). instr_word_q[10] is the
+  // direction bit; instr_word_q[9:5] is the 5-bit unsigned offset.
+  logic [ADDR_WIDTH-1:0] branch_target_dsjs;
+  logic signed [9:0]     dsjs_disp_bits;
+  // Build positive bit-offset = {1'b0, offset5, 4'h0} (signed 10-bit
+  // value in [0, +496]), then negate when D=1.
+  assign dsjs_disp_bits = instr_word_q[10]
+                        ? -10'($signed({1'b0, instr_word_q[9:5], 4'h0}))
+                        :  10'($signed({1'b0, instr_word_q[9:5], 4'h0}));
+  assign branch_target_dsjs = SHARED_ADDRESS ? shared_address_sum : pc_value + ADDR_WIDTH'(dsjs_disp_bits);
+
+  // ---------------------------------------------------------------------------
+  // Multi-step memory transaction support
+  //
+  // Some instructions (RETI, TRAP, MMTM, MMFM) chain multiple memory
+  // transactions within a single CORE_MEMORY stay. `mem_op_step` ticks
+  // through 0, 1, ... as each ack arrives; the FSM only exits to
+  // CORE_WRITEBACK on the final step. The `popped_st_q` / `popped_pc_q`
+  // / `mem_data_q` latches capture mem_rdata_eff between transactions
+  // since `mem_rdata_eff` itself is overwritten by the next read.
+  // ---------------------------------------------------------------------------
+  logic [1:0]            mem_op_step;
+  logic [DATA_WIDTH-1:0] popped_st_q;
+  logic [DATA_WIDTH-1:0] popped_pc_q;
+  // MOVE *Rs,*Rd (indirect-to-indirect): holds the field read at *Rs in
+  // step 0 so it can be written to *Rd in step 1 (mem_rdata_eff is overwritten
+  // by the next transaction).
+  logic [DATA_WIDTH-1:0] move_data_q;
+  // MOVE load operand: capture the raw return at the CORE_MEMORY ack.
+  // Field/sign extension follows this register and is consumed at WRITEBACK.
+  // FS/FE, force_byte/force_pixel and PSIZE cannot change between these two
+  // CPU enables: only the load's pointer update can occur at the ack, and
+  // the instruction/field controls are held until its WRITEBACK completes.
+  // This retiming adds no CPU cycle and takes the variable sign-bit mux off
+  // the full-rate memory/I/O return path.
+  logic [DATA_WIDTH-1:0] mv_load_data_q;
+
+  // TRAP 0 is special per SPVU001A page 12-253: it does NOT push PC' or
+  // ST onto the stack — it just sets ST <- 0x10 and fetches the vector
+  // at 0xFFFFFFE0. Intended for the SP-corrupt / SP-uninitialised case.
+  // We collapse the three-step TRAP sequence to a single vector-fetch
+  // step when k5 == 0 (and suppress the SP -64 update via the alu_b mux).
+  logic trap_skip_push;
+  assign trap_skip_push = (decoded.iclass == INSTR_TRAP) && (decoded.k5 == 5'd0);
+
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      mem_op_step <= 2'd0;
+      popped_st_q <= '0;
+      popped_pc_q <= '0;
+      move_data_q <= '0;
+      pix_dest_q  <= '0;
+    end else if (state_q == CORE_MEMORY && mem_ack) begin
+      // MOVE *Rs,*Rd: step 0 reads the source field; latch it so step 1
+      // can write it to the destination.
+      if (decoded.iclass == INSTR_MOVE_FIELD_M2M && mem_op_step == 2'd0) begin
+        move_data_q <= mem_rdata_eff;
+      end
+      // P0014/P0015: MOVE @,@ and MOVE *Rs(o),*Rd(o) step 0 latches the source
+      // field for the step-1 write.
+      if ((decoded.iclass == INSTR_MOVE_ABS_M2M ||
+           decoded.iclass == INSTR_MOVE_OFF_M2M ||
+           decoded.iclass == INSTR_MOVE_OFF_M2M_POST ||
+           decoded.iclass == INSTR_MOVE_ABS_M2M_POST) && mem_op_step == 2'd0) begin
+        move_data_q <= mem_rdata_eff;
+      end
+      // PIXT store plane-mask RMW: step 0 reads the destination pixel; latch
+      // it so step 1 can merge it under the plane mask.
+      if (decoded.iclass == INSTR_MOVE_FIELD_STORE && pixt_rmw && mem_op_step == 2'd0) begin
+        pix_dest_q <= mem_rdata_eff;
+      end
+      // NOTE: the MOVE field-load ack-cycle latch (mv_load_data_q) is driven
+      // by a separate always_ff further below (next to the MOVE field-size
+      // machinery that computes mv_load_data), since mv_load_data is not
+      // declared until that point in the file and Questa/ModelSim require
+      // declare-before-use within a module.
+      // Latch popped values per-iclass per-step before moving on.
+      if (decoded.iclass == INSTR_RETI) begin
+        if (mem_op_step == 2'd0) popped_st_q <= mem_rdata_eff;
+        if (mem_op_step == 2'd1) popped_pc_q <= mem_rdata_eff;
+      end
+      if (decoded.iclass == INSTR_POPST)
+        popped_st_q <= mem_rdata_eff;
+      if (decoded.iclass == INSTR_RETS)
+        popped_pc_q <= mem_rdata_eff;
+      // TRAP vector fetch:
+      //   - N>0: step 2 (after the two pushes).
+      //   - N=0: step 0 (the only step).
+      if (decoded.iclass == INSTR_TRAP) begin
+        if (trap_skip_push) begin
+          if (mem_op_step == 2'd0) popped_pc_q <= mem_rdata_eff;
+        end else begin
+          if (mem_op_step == 2'd2) popped_pc_q <= mem_rdata_eff;
+        end
+      end
+      // Step counter: advance unless this is the final step for the
+      // iclass, in which case reset to 0 for the next instruction.
+      unique case (decoded.iclass)
+        INSTR_RETI: mem_op_step <= (mem_op_step == 2'd1) ? 2'd0 : mem_op_step + 2'd1;
+        INSTR_TRAP: mem_op_step <= (trap_skip_push || mem_op_step == 2'd2)
+                                 ? 2'd0
+                                 : mem_op_step + 2'd1;
+        INSTR_MOVE_FIELD_M2M,
+        INSTR_MOVE_ABS_M2M,                              // P0014
+        INSTR_MOVE_OFF_M2M,                              // P0015
+        INSTR_MOVE_OFF_M2M_POST,
+        INSTR_MOVE_ABS_M2M_POST:
+                    mem_op_step <= (mem_op_step == 2'd1) ? 2'd0 : mem_op_step + 2'd1;
+        // PIXT store RMW: step 0 (read) -> step 1 (write) -> 0. Regular MOVE
+        // store (no force_pixel) is single-step and falls through to default.
+        INSTR_MOVE_FIELD_STORE:
+                    mem_op_step <= (pixt_rmw && mem_op_step == 2'd0) ? 2'd1 : 2'd0;
+        default:    mem_op_step <= 2'd0;
+      endcase
+    end else if (state_q == CORE_INT_VECTOR && mem_ack) begin
+      // Interrupt entry: latch the fetched trap vector (ISR entry address) so
+      // CORE_INT_DONE can load it into the PC.
+      popped_pc_q <= mem_rdata_eff;
+      mem_op_step <= 2'd0;
+    end else if (state_q != CORE_MEMORY) begin
+      // Defensive reset between instructions.
+      mem_op_step <= 2'd0;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // FILL L engine (Task 0087)
+  //
+  // FILL fills a DY×DX pixel array (DYDX=B7) with COLOR1 (B9), starting at
+  // DADDR (B2), rows DPTCH (B3) bits apart. Each pixel is a PSIZE-bit field
+  // write. Operands are latched at EXECUTE (DADDR/DPTCH/DYDX, read on the 3
+  // ports) and CORE_FILL_SETUP (COLOR1); the pixel loop runs in CORE_FILL,
+  // one write per ack. Replace mode only (window checking is never used for
+  // FILL; PMASK/transparency/PPOP default to no-op at reset and are not yet
+  // applied). DADDR is updated to the address following the last pixel.
+  // ---------------------------------------------------------------------------
+  logic [DATA_WIDTH-1:0] fill_dptch_q, fill_color_q, fill_daddr_raw_q;
+  logic [15:0]           fill_dx_q, fill_dy_q;
+  logic [DATA_WIDTH-1:0] fill_addr_q, fill_row_base_q;
+  logic [15:0]           fill_x_q, fill_y_q;
+  logic [DATA_WIDTH-1:0] fill_psize_ext;
+  logic                  fill_row_end, fill_done;
+  assign fill_psize_ext = DATA_WIDTH'(io_psize[FIELD_SIZE_WIDTH-1:0]);
+  assign fill_row_end   = (fill_x_q == fill_dx_q - 16'd1);
+  assign fill_done      = fill_row_end && (fill_y_q == fill_dy_q - 16'd1);
+
+  // FILL XY: convert the XY DADDR (latched raw at EXECUTE) to a linear start
+  // address at SETUP, where OFFSET (B4) is on read port 3. Same shift form as
+  // CVXYL: ((Y<<(31-CONVDP)) | (X<<log2 PSIZE)) + OFFSET.
+  logic [4:0]            fill_xy_yshift;
+  logic [DATA_WIDTH-1:0] fill_xy_linear, fill_start;
+  assign fill_xy_yshift = 5'd31 - io_convdp[4:0];
+  assign fill_xy_linear =
+      SHARED_XY ? shared_xy0_result : (({{16{fill_daddr_raw_q[DATA_WIDTH-1]}}, fill_daddr_raw_q[DATA_WIDTH-1:16]} << fill_xy_yshift)
+       | ({16'b0, fill_daddr_raw_q[15:0]} << pix_xy_xsh))
+      + rf_rs3_data;   // OFFSET (B4) at SETUP
+  assign fill_start = fill_is_xy ? fill_xy_linear : fill_daddr_raw_q;
+
+  logic shared_window_inside;
+
+  // FILL pixel processing (Task 0093). Each pixel is a read-modify-write: step
+  // 0 (fill_substep_q=0) reads the destination pixel into fill_dest_q, step 1
+  // writes fill_merged = PPOP(COLOR1, dest) plane-masked and transparency-
+  // checked. At reset defaults (PPOP=0/PMASK=0/T=0) merged = COLOR1, so a plain
+  // fill is unchanged (it just also reads first).
+  logic                  fill_substep_q;   // 0 = read dest, 1 = write merged
+  logic [DATA_WIDTH-1:0] fill_dest_q;      // destination pixel latched at read
+  logic [DATA_WIDTH-1:0] fill_pixel_mask, fill_pmask_field;
+  logic [DATA_WIDTH-1:0] fill_processed, fill_merged;
+  logic                  fill_transp;
+  // Window clipping (CONTROL.W = 3, FILL XY only — Task 0105). WSTART/WEND are
+  // XY (X in [15:0], Y in [31:16]). A pixel outside the inclusive window
+  // rectangle is left unchanged (write-back of the read dest, the same skip
+  // mechanism as transparency). W=1/W=2 (hit/miss detection, WV interrupt,
+  // abort) are NOT implemented yet (A0031) — only W=3 clips.
+  logic [DATA_WIDTH-1:0] fill_wstart_q, fill_wend_q;
+  logic                  fill_win_en_q;    // W=3 clipping active for this FILL
+  logic                  fill_w2_q;        // W=2 (miss detection) active for this FILL
+  logic [15:0]           fill_px, fill_py; // current pixel absolute XY
+  logic                  fill_in_window, fill_clip_out;
+  assign fill_px = fill_daddr_raw_q[15:0]            + fill_x_q;
+  assign fill_py = fill_daddr_raw_q[DATA_WIDTH-1:16] + fill_y_q;
+  assign fill_in_window = SHARED_WINDOW ? shared_window_inside :
+        (fill_px >= fill_wstart_q[15:0]) && (fill_px <= fill_wend_q[15:0])
+     && (fill_py >= fill_wstart_q[DATA_WIDTH-1:16]) && (fill_py <= fill_wend_q[DATA_WIDTH-1:16]);
+  assign fill_clip_out = fill_win_en_q && !fill_in_window;
+  // W=2 (miss detection): the whole array is drawn only if it lies entirely
+  // within the window. Containment is a single rectangle test on the array's
+  // corners, evaluated combinationally at CORE_FILL_SETUP_WIN from the live
+  // WSTART(port1)/WEND(port2) reads (X=[15:0], Y=[31:16]).
+  logic                  fill_array_inside;
+  logic [15:0]           fill_arr_x0, fill_arr_y0, fill_arr_x1, fill_arr_y1;
+  assign fill_arr_x0 = fill_daddr_raw_q[15:0];
+  assign fill_arr_y0 = fill_daddr_raw_q[DATA_WIDTH-1:16];
+  assign fill_arr_x1 = fill_arr_x0 + fill_dx_q - 16'd1;   // last column
+  assign fill_arr_y1 = fill_arr_y0 + fill_dy_q - 16'd1;   // last row
+  assign fill_array_inside = SHARED_WINDOW ? shared_window_inside :
+        (fill_arr_x0 >= rf_rs1_data[15:0]) && (fill_arr_x1 <= rf_rs2_data[15:0])
+     && (fill_arr_y0 >= rf_rs1_data[DATA_WIDTH-1:16]) && (fill_arr_y1 <= rf_rs2_data[DATA_WIDTH-1:16]);
+  // W=1 (hit detection): no pixels are drawn. The array "hits" the window if it
+  // overlaps at all; computed from the LATCHED WSTART/WEND (valid in
+  // CORE_FILL_WIN_HIT, after the SETUP_WIN latch). Overlap = NOT fully to one
+  // side. Inclusive corners.
+  logic fill_w1_q, fill_array_hit;
+  assign fill_array_hit = SHARED_WINDOW ? shared_window_inside : !(
+        (fill_arr_x1 < fill_wstart_q[15:0]) || (fill_arr_x0 > fill_wend_q[15:0])
+     || (fill_arr_y1 < fill_wstart_q[DATA_WIDTH-1:16]) || (fill_arr_y0 > fill_wend_q[DATA_WIDTH-1:16]));
+  // Window-violation flag write (sets V; the miss path also pulses wvp_set):
+  //   CORE_FILL_WIN_MISS — array outside the window → V=1, request WVP.
+  //   CORE_FILL_WB with W=2 (array was inside) → V=0, no interrupt.
+  // Shared window-violation flag write for FILL and PIXBLT W=2 (declared here;
+  // pblt_w2_q is assigned later — order-independent for these continuous
+  // assigns). win_flag_wb enables the V write; win_violation is the V value
+  // (1 = a miss); wvp_set pulses INTPEND.WV on a miss.
+  logic fill_win_flag_wb, fill_win_violation;
+  // V value written: W=2 miss → 1; W=2 inside (at WB) → 0; W=1 hit → V = NOT
+  // overlapped (1 if the array is entirely outside the window, else 0).
+  // DRAV per-pixel window write-back (CORE_WRITEBACK, W!=0): V = NOT inside.
+  logic drav_win_wb;
+  assign drav_win_wb = (state_q == CORE_WRITEBACK) && is_drav && (drav_w_q != 2'd0);
+  // LINE W=3 writes V at the d-writeback (V = NOT last-pixel-inside; no WVP).
+  logic line_win_wb;
+  assign line_win_wb = (state_q == CORE_LINE_WB_D) && line_win_en;
+  // Windowed XY PIXT writes V (and maybe WVP) at CORE_WRITEBACK, like DRAV.
+  logic pixt_win_wb;
+  assign pixt_win_wb = (state_q == CORE_WRITEBACK) && pixt_xy_win;
+  assign fill_win_violation = (state_q == CORE_FILL_WIN_MISS)
+                            || (state_q == CORE_PBLT_WIN_MISS)
+                            || ((state_q == CORE_FILL_WIN_HIT) && !fill_array_hit)
+                            || ((state_q == CORE_PBLT_WIN_HIT) && !pblt_array_hit)
+                            || (drav_win_wb && !drav_inside_q)
+                            || (line_win_wb && !line_last_inside_q)
+                            || (pixt_win_wb && !pixt_inside_q);
+  assign fill_win_flag_wb   = (state_q == CORE_FILL_WIN_MISS)
+                            || ((state_q == CORE_FILL_WB) && fill_w2_q)
+                            || (state_q == CORE_PBLT_WIN_MISS)
+                            || ((state_q == CORE_PBLT_WB2) && pblt_w2_q)
+                            || (state_q == CORE_FILL_WIN_HIT)
+                            || (state_q == CORE_PBLT_WIN_HIT)
+                            || drav_win_wb
+                            || line_win_wb
+                            || pixt_win_wb;
+  // WVP requested on a W=2 miss / W=1 hit for the array engines; for DRAV (per
+  // pixel) on a W=1 hit (pixel inside) or a W=2 miss (pixel outside).
+  assign wvp_set = (state_q == CORE_FILL_WIN_MISS)
+                 || (state_q == CORE_PBLT_WIN_MISS)
+                 || ((state_q == CORE_FILL_WIN_HIT) && fill_array_hit)
+                 || ((state_q == CORE_PBLT_WIN_HIT) && pblt_array_hit)
+                 || (drav_win_wb && (((drav_w_q == 2'd1) && drav_inside_q)
+                                  || ((drav_w_q == 2'd2) && !drav_inside_q)))
+                 || (line_win_wb && line_aborted_q)   // LINE W=1/W=2 abort
+                 || (pixt_win_wb && (((io_control[CTRL_W_HI:CTRL_W_LO] == 2'd1) && pixt_inside_q)
+                                  || ((io_control[CTRL_W_HI:CTRL_W_LO] == 2'd2) && !pixt_inside_q)));
+  assign fill_pixel_mask  = (32'd1 << io_psize[FIELD_SIZE_WIDTH-1:0]) - 32'd1;
+  assign fill_pmask_field = {{(DATA_WIDTH-16){1'b0}}, io_pmask} & fill_pixel_mask;
+  assign fill_processed   = ppop_apply(fill_color_q, fill_dest_q,
+                                       io_control[CTRL_PPOP_HI:CTRL_PPOP_LO], fill_pixel_mask);
+  assign fill_transp      = io_control[CTRL_T_BIT] && ((fill_processed & fill_pixel_mask) == '0);
+  assign fill_merged      = SHARED_PIXEL ? shared_pixel_result : (fill_transp || fill_clip_out)
+                          ? fill_dest_q
+                          : ((fill_processed & ~fill_pmask_field) | (fill_dest_q & fill_pmask_field));
+
+  generate if (!SHARED_GRAPHICS_REGS) begin : legacy_fill_registers
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      fill_dptch_q     <= '0;
+      fill_color_q     <= '0;
+      fill_daddr_raw_q <= '0;
+      fill_dx_q        <= '0;
+      fill_dy_q        <= '0;
+      fill_addr_q      <= '0;
+      fill_row_base_q  <= '0;
+      fill_x_q         <= '0;
+      fill_y_q         <= '0;
+      fill_substep_q   <= 1'b0;
+      fill_dest_q      <= '0;
+      fill_wstart_q    <= '0;
+      fill_wend_q      <= '0;
+      fill_win_en_q    <= 1'b0;
+      fill_w2_q        <= 1'b0;
+      fill_w1_q        <= 1'b0;
+    end else begin
+      // EXECUTE: latch DADDR(port1)/DPTCH(port2)/DYDX(port3) for FILL. The
+      // start address (possibly XY-converted) is finalized at SETUP. Window
+      // clipping engages only for FILL XY with CONTROL.W = 3.
+      if (state_q == CORE_EXECUTE && is_fill) begin
+        fill_daddr_raw_q <= rf_rs1_data;       // DADDR (linear, or XY for FILL XY)
+        fill_dptch_q     <= rf_rs2_data;       // DPTCH
+        fill_dx_q        <= rf_rs3_data[15:0]; // DX
+        fill_dy_q        <= rf_rs3_data[DATA_WIDTH-1:16]; // DY
+        fill_x_q         <= 16'd0;
+        fill_y_q         <= 16'd0;
+        fill_win_en_q    <= fill_is_xy &&
+                            (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd3);
+        fill_w2_q        <= fill_is_xy &&
+                            (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd2);
+        fill_w1_q        <= fill_is_xy &&
+                            (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd1);
+      end
+      // CORE_FILL_SETUP_WIN: latch WSTART(port1=B5)/WEND(port2=B6) for clip.
+      if (state_q == CORE_FILL_SETUP_WIN) begin
+        fill_wstart_q <= rf_rs1_data;
+        fill_wend_q   <= rf_rs2_data;
+      end
+      // CORE_FILL_SETUP: latch COLOR1 (port1) and the linear start address
+      // (port3 = OFFSET for the XY conversion); start at the read sub-step.
+      if (state_q == CORE_FILL_SETUP) begin
+        fill_color_q    <= rf_rs1_data;        // COLOR1
+        fill_addr_q     <= fill_start;
+        fill_row_base_q <= fill_start;
+        fill_substep_q  <= 1'b0;
+      end
+      // CORE_FILL: per pixel, read (sub-step 0) then write (sub-step 1).
+      if (state_q == CORE_FILL && mem_ack) begin
+        fill_substep_q <= ~fill_substep_q;
+        if (!fill_substep_q) begin
+          // Read ack: latch the destination pixel for processing.
+          fill_dest_q <= mem_rdata_eff;
+        end else begin
+          // Write ack: advance to the next pixel (or to the final DADDR).
+          fill_addr_q <= fill_addr_q + fill_psize_ext;
+          if (fill_row_end && !fill_done) begin
+            // Row complete (not the last): jump to the next row's base.
+            fill_y_q        <= fill_y_q + 16'd1;
+            fill_row_base_q <= fill_row_base_q + fill_dptch_q;
+            fill_addr_q     <= fill_row_base_q + fill_dptch_q;
+            fill_x_q        <= 16'd0;
+          end else if (!fill_done) begin
+            fill_x_q <= fill_x_q + 16'd1;
+          end
+          // On fill_done the write ack leaves fill_addr_q at the pixel
+          // following the last (the final DADDR); the FSM moves to CORE_FILL_WB.
+        end
+      end
+    end
+  end
+  end endgenerate
+
+  // ---------------------------------------------------------------------------
+  // PIXBLT L,L engine (Task 0094)
+  //
+  // Transfer a DY×DX pixel array from the SOURCE array (SADDR=B0, rows SPTCH=B1
+  // apart) to the DESTINATION array (DADDR=B2, rows DPTCH=B3 apart), processing
+  // each pixel: written = PPOP(source pixel, destination pixel), plane-masked
+  // and transparency-checked. Operands are read at EXECUTE (SADDR/DADDR/DYDX)
+  // and CORE_PBLT_SETUP (SPTCH/DPTCH). Each pixel is a 3-step sequence
+  // (substep 0 read source, 1 read destination, 2 write); both pointers advance
+  // by PSIZE per pixel and row-step by their pitch. SADDR/DADDR are updated to
+  // the pixel following their last (CORE_PBLT_WB → B0, CORE_PBLT_WB2 → B2).
+  // No corner adjust (top-left → bottom-right), no window checking yet.
+  // ---------------------------------------------------------------------------
+  logic [DATA_WIDTH-1:0] pblt_sptch_q, pblt_dptch_q;
+  logic [15:0]           pblt_dx_q, pblt_dy_q;
+  logic [DATA_WIDTH-1:0] pblt_src_addr_q, pblt_dst_addr_q;
+  logic [DATA_WIDTH-1:0] pblt_src_row_q, pblt_dst_row_q;
+  logic [15:0]           pblt_x_q, pblt_y_q;
+  logic [1:0]            pblt_substep_q;     // 0 read src, 1 read dst, 2 write
+  logic [DATA_WIDTH-1:0] pblt_src_pix_q, pblt_dst_pix_q;
+  logic [DATA_WIDTH-1:0] pblt_psize_ext, pblt_pixel_mask, pblt_pmask_field;
+  logic [DATA_WIDTH-1:0] pblt_processed, pblt_merged;
+  logic                  pblt_row_end, pblt_done, pblt_transp;
+  // PIXBLT B (color expand): COLOR0/COLOR1 latched at SETUP2; the source read is
+  // 1 bit (mem_size 1, src step 1) and expands to COLOR1 / COLOR0.
+  logic [DATA_WIDTH-1:0] pblt_color0_q, pblt_color1_q;
+  logic [DATA_WIDTH-1:0] pblt_src_eff, pblt_src_step;
+  assign pblt_psize_ext   = DATA_WIDTH'(io_psize[FIELD_SIZE_WIDTH-1:0]);
+  assign pblt_pixel_mask  = (32'd1 << io_psize[FIELD_SIZE_WIDTH-1:0]) - 32'd1;
+  assign pblt_pmask_field = {{(DATA_WIDTH-16){1'b0}}, io_pmask} & pblt_pixel_mask;
+  assign pblt_row_end     = (pblt_x_q == pblt_dx_q - 16'd1);
+  assign pblt_done        = pblt_row_end && (pblt_y_q == pblt_dy_q - 16'd1);
+  // Effective source pixel: a binary source bit selects COLOR1/COLOR0.
+  assign pblt_src_eff     = decoded.blt_binary
+                          ? (pblt_src_pix_q[0] ? pblt_color1_q : pblt_color0_q)
+                          : pblt_src_pix_q;
+  // Source advances 1 bit/pixel for the binary form, PSIZE bits otherwise.
+  assign pblt_src_step    = decoded.blt_binary ? 32'd1 : pblt_psize_ext;
+  assign pblt_processed   = ppop_apply(pblt_src_eff, pblt_dst_pix_q,
+                                       io_control[CTRL_PPOP_HI:CTRL_PPOP_LO], pblt_pixel_mask);
+  assign pblt_transp      = io_control[CTRL_T_BIT] && ((pblt_processed & pblt_pixel_mask) == '0);
+  // Window clipping (CONTROL.W=3, PIXBLT with XY dest — Task 0106). The raw XY
+  // DADDR is preserved (pblt_dst_xy_raw_q) because pblt_dst_addr_q is converted
+  // to linear at SETUP; each pixel's absolute XY = (rawX+col, rawY+row) is
+  // tested against the inclusive [WSTART..WEND] rectangle and out-of-window
+  // pixels are left unchanged (same skip path as transparency). W=1/W=2 and the
+  // WV interrupt are not implemented (A0031).
+  logic [DATA_WIDTH-1:0] pblt_dst_xy_raw_q, pblt_wstart_q, pblt_wend_q;
+  logic                  pblt_win_en_q;    // W=3 per-pixel clip active
+  logic [15:0]           pblt_px, pblt_py;
+  logic                  pblt_in_window, pblt_clip_out;
+  assign pblt_px = pblt_dst_xy_raw_q[15:0]            + pblt_x_q;
+  assign pblt_py = pblt_dst_xy_raw_q[DATA_WIDTH-1:16] + pblt_y_q;
+  assign pblt_in_window = SHARED_WINDOW ? shared_window_inside :
+        (pblt_px >= pblt_wstart_q[15:0]) && (pblt_px <= pblt_wend_q[15:0])
+     && (pblt_py >= pblt_wstart_q[DATA_WIDTH-1:16]) && (pblt_py <= pblt_wend_q[DATA_WIDTH-1:16]);
+  assign pblt_clip_out = pblt_win_en_q && !pblt_in_window;
+  // W=2 (miss detection): array containment test on the dest corners, evaluated
+  // combinationally at CORE_PBLT_SETUP_WIN from the live WSTART(port1)/WEND
+  // (port2) reads (mirrors the FILL W=2 path).
+  logic        pblt_array_inside;
+  logic [15:0] pblt_arr_x0, pblt_arr_y0, pblt_arr_x1, pblt_arr_y1;
+  assign pblt_arr_x0 = pblt_dst_xy_raw_q[15:0];
+  assign pblt_arr_y0 = pblt_dst_xy_raw_q[DATA_WIDTH-1:16];
+  assign pblt_arr_x1 = pblt_arr_x0 + pblt_dx_q - 16'd1;
+  assign pblt_arr_y1 = pblt_arr_y0 + pblt_dy_q - 16'd1;
+  assign pblt_array_inside = SHARED_WINDOW ? shared_window_inside :
+        (pblt_arr_x0 >= rf_rs1_data[15:0]) && (pblt_arr_x1 <= rf_rs2_data[15:0])
+     && (pblt_arr_y0 >= rf_rs1_data[DATA_WIDTH-1:16]) && (pblt_arr_y1 <= rf_rs2_data[DATA_WIDTH-1:16]);
+  // W=1 (hit detection): never draws; overlap test from the LATCHED WSTART/WEND
+  // (valid in CORE_PBLT_WIN_HIT). Mirrors the FILL W=1 path.
+  assign pblt_array_hit = SHARED_WINDOW ? shared_window_inside : !(
+        (pblt_arr_x1 < pblt_wstart_q[15:0]) || (pblt_arr_x0 > pblt_wend_q[15:0])
+     || (pblt_arr_y1 < pblt_wstart_q[DATA_WIDTH-1:16]) || (pblt_arr_y0 > pblt_wend_q[DATA_WIDTH-1:16]));
+  assign pblt_merged      = SHARED_PIXEL ? shared_pixel_result : (pblt_transp || pblt_clip_out)
+                          ? pblt_dst_pix_q
+                          : ((pblt_processed & ~pblt_pmask_field) | (pblt_dst_pix_q & pblt_pmask_field));
+
+  // PIXBLT XY variants: convert the XY SADDR/DADDR (latched raw at EXECUTE) to a
+  // linear address at SETUP (source via CONVSP, dest via CONVDP, + OFFSET on
+  // read port 3, + log2 PSIZE = pix_xy_xsh). Same shift form as CVXYL/FILL XY.
+  logic [DATA_WIDTH-1:0] pblt_src_conv, pblt_dst_conv;
+  assign pblt_src_conv =
+      SHARED_XY ? shared_xy0_result : (({{16{pblt_src_addr_q[DATA_WIDTH-1]}}, pblt_src_addr_q[DATA_WIDTH-1:16]} << (5'd31 - io_convsp[4:0]))
+       | ({16'b0, pblt_src_addr_q[15:0]} << pix_xy_xsh)) + rf_rs3_data;
+  assign pblt_dst_conv =
+      SHARED_XY ? shared_xy1_result : (({{16{pblt_dst_addr_q[DATA_WIDTH-1]}}, pblt_dst_addr_q[DATA_WIDTH-1:16]} << (5'd31 - io_convdp[4:0]))
+       | ({16'b0, pblt_dst_addr_q[15:0]} << pix_xy_xsh)) + rf_rs3_data;
+
+  generate if (!SHARED_GRAPHICS_REGS) begin : legacy_pblt_registers
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      pblt_sptch_q    <= '0;
+      pblt_dptch_q    <= '0;
+      pblt_dx_q       <= '0;
+      pblt_dy_q       <= '0;
+      pblt_src_addr_q <= '0;
+      pblt_dst_addr_q <= '0;
+      pblt_src_row_q  <= '0;
+      pblt_dst_row_q  <= '0;
+      pblt_x_q        <= '0;
+      pblt_y_q        <= '0;
+      pblt_substep_q  <= 2'd0;
+      pblt_src_pix_q  <= '0;
+      pblt_dst_pix_q  <= '0;
+      pblt_color0_q   <= '0;
+      pblt_color1_q   <= '0;
+      pblt_dst_xy_raw_q <= '0;
+      pblt_wstart_q   <= '0;
+      pblt_wend_q     <= '0;
+      pblt_win_en_q   <= 1'b0;
+      pblt_w2_q       <= 1'b0;
+      pblt_w1_q       <= 1'b0;
+    end else begin
+      // EXECUTE: latch SADDR(port1) / DADDR(port2) / DYDX(port3). Window
+      // clipping engages only for an XY destination with CONTROL.W=3; keep the
+      // raw XY DADDR (pblt_dst_addr_q is converted to linear at SETUP).
+      if (state_q == CORE_EXECUTE && is_pblt) begin
+        pblt_src_addr_q <= rf_rs1_data;          // SADDR
+        pblt_src_row_q  <= rf_rs1_data;
+        pblt_dst_addr_q <= rf_rs2_data;          // DADDR
+        pblt_dst_row_q  <= rf_rs2_data;
+        pblt_dst_xy_raw_q <= rf_rs2_data;        // raw XY DADDR (for window)
+        pblt_dx_q       <= rf_rs3_data[15:0];
+        pblt_dy_q       <= rf_rs3_data[DATA_WIDTH-1:16];
+        pblt_x_q        <= 16'd0;
+        pblt_y_q        <= 16'd0;
+        pblt_substep_q  <= 2'd0;
+        pblt_win_en_q   <= decoded.blt_dst_xy &&
+                           (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd3);
+        pblt_w2_q       <= decoded.blt_dst_xy &&
+                           (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd2);
+        pblt_w1_q       <= decoded.blt_dst_xy &&
+                           (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd1);
+      end
+      // CORE_PBLT_SETUP_WIN: latch WSTART(port1=B5)/WEND(port2=B6) for clip.
+      if (state_q == CORE_PBLT_SETUP_WIN) begin
+        pblt_wstart_q <= rf_rs1_data;
+        pblt_wend_q   <= rf_rs2_data;
+      end
+      // CORE_PBLT_SETUP: latch SPTCH(port1) / DPTCH(port2); for the XY variants
+      // convert the XY SADDR/DADDR to linear (port3 = OFFSET here).
+      if (state_q == CORE_PBLT_SETUP) begin
+        pblt_sptch_q <= rf_rs1_data;
+        pblt_dptch_q <= rf_rs2_data;
+        if (decoded.blt_src_xy) begin
+          pblt_src_addr_q <= pblt_src_conv;
+          pblt_src_row_q  <= pblt_src_conv;
+        end
+        if (decoded.blt_dst_xy) begin
+          pblt_dst_addr_q <= pblt_dst_conv;
+          pblt_dst_row_q  <= pblt_dst_conv;
+        end
+      end
+      // CORE_PBLT_SETUP2 (binary form): latch COLOR0(port1) / COLOR1(port2).
+      if (state_q == CORE_PBLT_SETUP2) begin
+        pblt_color0_q <= rf_rs1_data;
+        pblt_color1_q <= rf_rs2_data;
+      end
+      // CORE_PBLT: per pixel, read src (0) / read dst (1) / write (2).
+      if (state_q == CORE_PBLT && mem_ack) begin
+        if (pblt_substep_q == 2'd0) begin
+          pblt_src_pix_q <= mem_rdata_eff;
+          pblt_substep_q <= 2'd1;
+        end else if (pblt_substep_q == 2'd1) begin
+          pblt_dst_pix_q <= mem_rdata_eff;
+          pblt_substep_q <= 2'd2;
+        end else begin
+          // Write ack: advance both pointers to the next pixel (source by 1
+          // bit for the binary form, PSIZE otherwise; dest always by PSIZE).
+          pblt_substep_q  <= 2'd0;
+          pblt_src_addr_q <= pblt_src_addr_q + pblt_src_step;
+          pblt_dst_addr_q <= pblt_dst_addr_q + pblt_psize_ext;
+          if (pblt_done) begin
+            // P0009: on the FINAL pixel, leave SADDR/DADDR pointing at the START
+            // of the row PAST the array (base + DY*pitch) — matching the TMS34010
+            // UG / MAME, so consecutive PIXBLTs walk a sprite sheet. The row-end
+            // advance below was gated `!pblt_done`, which left SADDR at
+            // last-row-start + width, short by (pitch - width) bits. Measured on a
+            // Smash T.V. font glyph (SPTCH=8, width=6): SADDR came out 2 bits short
+            // of MAME (FFF55826 vs FFF55828).
+            pblt_src_addr_q <= pblt_src_row_q + pblt_sptch_q;
+            pblt_dst_addr_q <= pblt_dst_row_q + pblt_dptch_q;
+          end else if (pblt_row_end) begin
+            pblt_y_q        <= pblt_y_q + 16'd1;
+            pblt_src_row_q  <= pblt_src_row_q + pblt_sptch_q;
+            pblt_dst_row_q  <= pblt_dst_row_q + pblt_dptch_q;
+            pblt_src_addr_q <= pblt_src_row_q + pblt_sptch_q;
+            pblt_dst_addr_q <= pblt_dst_row_q + pblt_dptch_q;
+            pblt_x_q        <= 16'd0;
+          end else begin
+            pblt_x_q <= pblt_x_q + 16'd1;
+          end
+        end
+      end
+    end
+  end
+  end endgenerate
+
+  // ---------------------------------------------------------------------------
+  // DRAV (Draw and Advance) — SPVU001A page 12-67.
+  //
+  // A single-pixel COLOR1 draw at Rd's XY address, then Rd advances by Rs as an
+  // XY add. At EXECUTE: Rd (port2) is XY-converted to a linear address with
+  // OFFSET (port3) — pix_xy_dst_linear, the same form as PIXT XY / FILL XY —
+  // and latched; Rs/Rd are latched for the advance. CORE_DRAV then runs a
+  // 2-step read-dest / write-merged RMW (COLOR1 on port1), reusing the FILL
+  // pixel-merge (PPOP / transparency / PMASK). The advance is written back at
+  // CORE_WRITEBACK. Window modes (W=1/2/3) are not yet applied (A0031, W=0).
+  // ---------------------------------------------------------------------------
+  logic [DATA_WIDTH-1:0] drav_rd_q, drav_rs_q, drav_linear_q, drav_dest_q;
+  logic                  drav_substep_q;    // 0 = read dest, 1 = write merged
+  // Per-pixel window check (CONTROL.W, Task 0112). Rd's XY is tested against the
+  // inclusive [WSTART..WEND] rectangle (read at CORE_DRAV_SETUP_WIN). The pixel
+  // is drawn only for W=0, or W=2/W=3 when inside. V (W!=0) = NOT inside; WVP is
+  // requested for W=1 inside (hit) or W=2 outside (miss). The advance always
+  // happens. Reuses the shared fill_win_flag_wb / wvp_set V-write path.
+  logic                  drav_in_window;    // combinational test at SETUP_WIN
+  logic                  drav_draw;         // pixel is actually written
+  assign drav_in_window = SHARED_WINDOW ? shared_window_inside :
+        (drav_rd_q[15:0] >= rf_rs1_data[15:0]) && (drav_rd_q[15:0] <= rf_rs2_data[15:0])
+     && (drav_rd_q[DATA_WIDTH-1:16] >= rf_rs1_data[DATA_WIDTH-1:16])
+     && (drav_rd_q[DATA_WIDTH-1:16] <= rf_rs2_data[DATA_WIDTH-1:16]);
+  // Drawn for W=0 always; for W=2/W=3 only when inside; W=1 never draws.
+  assign drav_draw = (drav_w_q == 2'd0)
+                   || (((drav_w_q == 2'd2) || (drav_w_q == 2'd3)) && drav_inside_q);
+  logic [DATA_WIDTH-1:0] drav_pixel_mask, drav_pmask_field, drav_processed, drav_merged;
+  logic                  drav_transp;
+  logic [DATA_WIDTH-1:0] drav_advance, shared_xy_arith_result;
+  assign drav_pixel_mask  = (32'd1 << io_psize[FIELD_SIZE_WIDTH-1:0]) - 32'd1;
+  assign drav_pmask_field = {{(DATA_WIDTH-16){1'b0}}, io_pmask} & drav_pixel_mask;
+  // COLOR1 is rf_rs1_data in CORE_DRAV (port1 reads B9 there).
+  assign drav_processed   = ppop_apply(rf_rs1_data, drav_dest_q,
+                                       io_control[CTRL_PPOP_HI:CTRL_PPOP_LO], drav_pixel_mask);
+  assign drav_transp      = io_control[CTRL_T_BIT] && ((drav_processed & drav_pixel_mask) == '0);
+  assign drav_merged      = SHARED_PIXEL ? shared_pixel_result : drav_transp
+                          ? drav_dest_q
+                          : ((drav_processed & ~drav_pmask_field) | (drav_dest_q & drav_pmask_field));
+  // Rd advanced by Rs: independent 16-bit X and Y adds, no carry X->Y.
+  assign drav_advance = SHARED_XY_ARITH ? shared_xy_arith_result : {drav_rd_q[DATA_WIDTH-1:16] + drav_rs_q[DATA_WIDTH-1:16],
+                         drav_rd_q[15:0]            + drav_rs_q[15:0]};
+
+  generate if (!SHARED_GRAPHICS_REGS) begin : legacy_drav_registers
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      drav_rd_q      <= '0;
+      drav_rs_q      <= '0;
+      drav_linear_q  <= '0;
+      drav_dest_q    <= '0;
+      drav_substep_q <= 1'b0;
+      drav_w_q       <= 2'd0;
+      drav_inside_q  <= 1'b0;
+    end else begin
+      if (state_q == CORE_EXECUTE && is_drav) begin
+        drav_rd_q      <= rf_rs2_data;        // Rd (XY dest)
+        drav_rs_q      <= rf_rs1_data;        // Rs (XY increment)
+        drav_linear_q  <= pix_xy_dst_linear;  // convert(Rd) + OFFSET (port3)
+        drav_substep_q <= 1'b0;
+        drav_w_q       <= io_control[CTRL_W_HI:CTRL_W_LO];
+      end
+      // CORE_DRAV_SETUP_WIN: latch the window test (WSTART=port1, WEND=port2).
+      if (state_q == CORE_DRAV_SETUP_WIN) drav_inside_q <= drav_in_window;
+      if (state_q == CORE_DRAV && mem_ack) begin
+        drav_substep_q <= ~drav_substep_q;
+        if (!drav_substep_q) drav_dest_q <= mem_rdata_eff;  // read ack
+      end
+    end
+  end
+  end endgenerate
+
+  // ---------------------------------------------------------------------------
+  // LINE (Bresenham inner loop) — SPVU001A page 12-99.
+  //
+  // The implied B operands are read over 3 setup cycles (line_rd_b above), then
+  // CORE_LINE_DRAW runs the per-pixel loop: draw COLOR1 at DADDR's XY (2-step
+  // RMW, reusing the FILL/DRAV pixel merge), then step the decision variable d
+  // and DADDR (+INC1 when d>0 i.e. the diagonal move, else +INC2) and decrement
+  // COUNT. The Z bit (instr_word_q[7]) selects whether d=0 counts as ">0"
+  // (Z=1 -> d>=0). At the end d/DADDR/COUNT are written back to B0/B2/B10.
+  // Window modes are not yet applied (W=0; A0031). DADDR/INC adds are XY
+  // (independent 16-bit halves, no carry), matching ADDXY / DRAV.
+  // ---------------------------------------------------------------------------
+  logic [DATA_WIDTH-1:0] line_d_q, line_count_q, line_inc1_q, line_inc2_q;
+  logic [DATA_WIDTH-1:0] line_offset_q, line_daddr_q, line_color_q, line_dest_q;
+  logic [15:0]           line_b_q, line_a_q;
+  logic                  line_substep_q;
+  // Per-pixel linear address from DADDR's XY (same conversion form as FILL XY).
+  logic [DATA_WIDTH-1:0] line_linear;
+  assign line_linear =
+      SHARED_XY ? shared_xy0_result : (({{16{line_daddr_q[DATA_WIDTH-1]}}, line_daddr_q[DATA_WIDTH-1:16]} << (5'd31 - io_convdp[4:0]))
+       | ({16'b0, line_daddr_q[15:0]} << pix_xy_xsh)) + line_offset_q;
+  // Pixel merge (PPOP / transparency / PMASK), COLOR1 = line_color_q.
+  logic [DATA_WIDTH-1:0] line_pixel_mask, line_pmask_field, line_processed, line_merged;
+  logic                  line_transp;
+  assign line_pixel_mask  = (32'd1 << io_psize[FIELD_SIZE_WIDTH-1:0]) - 32'd1;
+  assign line_pmask_field = {{(DATA_WIDTH-16){1'b0}}, io_pmask} & line_pixel_mask;
+  assign line_processed   = ppop_apply(line_color_q, line_dest_q,
+                                       io_control[CTRL_PPOP_HI:CTRL_PPOP_LO], line_pixel_mask);
+  assign line_transp      = io_control[CTRL_T_BIT] && ((line_processed & line_pixel_mask) == '0);
+  // Per-pixel window clip (CONTROL.W=3, Task 0115). LINE inhibits writes to
+  // pixels outside the window (no preclip — tested at draw time); the V bit at
+  // the end reflects whether the last pixel calculated was inside. W=1/W=2
+  // (abort modes) are deferred (A0031). WSTART/WEND read at CORE_LINE_SETUP_WIN.
+  logic [DATA_WIDTH-1:0] line_wstart_q, line_wend_q;
+  logic [1:0]            line_w_mode;
+  logic                  line_in_window, line_draw_pixel, line_clip_out, line_abort;
+  assign line_w_mode    = io_control[CTRL_W_HI:CTRL_W_LO];
+  assign line_win_en    = (line_w_mode != 2'd0);
+  assign line_in_window = SHARED_WINDOW ? shared_window_inside :
+        (line_daddr_q[15:0] >= line_wstart_q[15:0]) && (line_daddr_q[15:0] <= line_wend_q[15:0])
+     && (line_daddr_q[DATA_WIDTH-1:16] >= line_wstart_q[DATA_WIDTH-1:16])
+     && (line_daddr_q[DATA_WIDTH-1:16] <= line_wend_q[DATA_WIDTH-1:16]);
+  // Draw decision: W=1 (hit) draws the pixels OUTSIDE the window and aborts on
+  // an inside pixel; W=2 (miss) and W=3 (clip) draw INSIDE pixels (W=2 aborts
+  // on an outside pixel, W=3 just inhibits it). V at the end is NOT last-inside
+  // for every windowed mode; WVP is set on a W=1/W=2 abort.
+  assign line_draw_pixel = (line_w_mode == 2'd1) ? !line_in_window : line_in_window;
+  assign line_clip_out   = line_win_en && !line_draw_pixel;
+  assign line_abort      = (line_w_mode == 2'd1 &&  line_in_window)
+                         || (line_w_mode == 2'd2 && !line_in_window);
+  assign line_merged      = SHARED_PIXEL ? shared_pixel_result : (line_transp || line_clip_out)
+                          ? line_dest_q
+                          : ((line_processed & ~line_pmask_field) | (line_dest_q & line_pmask_field));
+  // Bresenham decision: branch (diagonal, +INC1) when d>0 (Z=0) or d>=0 (Z=1).
+  logic        line_branch;
+  logic [DATA_WIDTH-1:0] line_2b, line_2a, line_d_next, line_daddr_next, line_count_next;
+  assign line_branch = instr_word_q[7] ? !line_d_q[DATA_WIDTH-1]              // Z=1: d >= 0
+                                       : (!line_d_q[DATA_WIDTH-1] && (line_d_q != '0)); // Z=0: d > 0
+  assign line_2b = {16'b0, line_b_q} << 1;
+  assign line_2a = {16'b0, line_a_q} << 1;
+  assign line_d_next = line_branch ? (line_d_q + line_2b - line_2a)
+                                   : (line_d_q + line_2b);
+  assign line_daddr_next = SHARED_XY_ARITH ? shared_xy_arith_result : line_branch
+      ? {line_daddr_q[DATA_WIDTH-1:16] + line_inc1_q[DATA_WIDTH-1:16],
+         line_daddr_q[15:0]            + line_inc1_q[15:0]}
+      : {line_daddr_q[DATA_WIDTH-1:16] + line_inc2_q[DATA_WIDTH-1:16],
+         line_daddr_q[15:0]            + line_inc2_q[15:0]};
+  assign line_count_next = line_count_q - 32'd1;
+
+  generate if (!SHARED_GRAPHICS_REGS) begin : legacy_line_registers
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      line_d_q       <= '0;
+      line_count_q   <= '0;
+      line_inc1_q    <= '0;
+      line_inc2_q    <= '0;
+      line_offset_q  <= '0;
+      line_daddr_q   <= '0;
+      line_color_q   <= '0;
+      line_dest_q    <= '0;
+      line_b_q       <= '0;
+      line_a_q       <= '0;
+      line_substep_q <= 1'b0;
+      line_wstart_q  <= '0;
+      line_wend_q    <= '0;
+      line_last_inside_q <= 1'b0;
+      line_aborted_q <= 1'b0;
+    end else begin
+      // Clear the abort flag when a new LINE starts (at EXECUTE).
+      if (state_q == CORE_EXECUTE && is_line) line_aborted_q <= 1'b0;
+      if (state_q == CORE_LINE_SETUP_WIN) begin
+        line_wstart_q <= rf_rs1_data;          // WSTART (B5)
+        line_wend_q   <= rf_rs2_data;          // WEND (B6)
+      end
+      if (state_q == CORE_LINE_SETUP1) begin
+        line_d_q     <= rf_rs1_data;                 // d (B0)
+        line_b_q     <= rf_rs2_data[DATA_WIDTH-1:16]; // b = DYDX minor
+        line_a_q     <= rf_rs2_data[15:0];            // a = DYDX major
+        line_count_q <= rf_rs3_data;                 // COUNT (B10)
+      end
+      if (state_q == CORE_LINE_SETUP2) begin
+        line_inc1_q   <= rf_rs1_data;                // INC1 (B11)
+        line_inc2_q   <= rf_rs2_data;                // INC2 (B12)
+        line_offset_q <= rf_rs3_data;                // OFFSET (B4)
+      end
+      if (state_q == CORE_LINE_SETUP3) begin
+        line_daddr_q   <= rf_rs1_data;               // DADDR (B2)
+        line_color_q   <= rf_rs2_data;               // COLOR1 (B9)
+        line_substep_q <= 1'b0;
+      end
+      if (state_q == CORE_LINE_DRAW && mem_ack) begin
+        line_substep_q <= ~line_substep_q;
+        if (!line_substep_q) begin
+          line_dest_q <= mem_rdata_eff;              // read ack
+        end else begin
+          // Write ack: record this pixel's window status (for the final V) and
+          // whether it triggered a W=1/W=2 abort, then advance the Bresenham
+          // state for the next pixel.
+          line_last_inside_q <= line_in_window;
+          if (line_abort) line_aborted_q <= 1'b1;
+          line_d_q     <= line_d_next;
+          line_daddr_q <= line_daddr_next;
+          line_count_q <= line_count_next;
+        end
+      end
+    end
+  end
+  end endgenerate
+
+  // Graphics instructions run to completion in disjoint FSM states. Their
+  // setup states overwrite every live operand before use, so the temporary
+  // storage can be overlaid. Architectural registers and sequencer flags
+  // remain separate. One writer owns the pool; no clocks or cycles are added.
+  generate if (SHARED_GRAPHICS_REGS) begin : shared_graphics_registers
+    logic [DATA_WIDTH-1:0] graphics_word_q [0:12];
+    logic [15:0] graphics_half_q [0:3];
+    assign pblt_sptch_q = graphics_word_q[0];
+    assign line_inc1_q = graphics_word_q[0];
+    assign drav_rs_q = graphics_word_q[0];
+    assign pblt_dptch_q = graphics_word_q[1];
+    assign fill_dptch_q = graphics_word_q[1];
+    assign line_inc2_q = graphics_word_q[1];
+    assign pblt_src_addr_q = graphics_word_q[2];
+    assign fill_daddr_raw_q = graphics_word_q[2];
+    assign line_daddr_q = graphics_word_q[2];
+    assign drav_rd_q = graphics_word_q[2];
+    assign pblt_dst_addr_q = graphics_word_q[3];
+    assign fill_addr_q = graphics_word_q[3];
+    assign line_d_q = graphics_word_q[3];
+    assign drav_linear_q = graphics_word_q[3];
+    assign pblt_src_row_q = graphics_word_q[4];
+    assign fill_row_base_q = graphics_word_q[4];
+    assign line_count_q = graphics_word_q[4];
+    assign pblt_dst_row_q = graphics_word_q[5];
+    assign line_offset_q = graphics_word_q[5];
+    assign pblt_src_pix_q = graphics_word_q[6];
+    assign fill_color_q = graphics_word_q[6];
+    assign line_color_q = graphics_word_q[6];
+    assign pblt_dst_pix_q = graphics_word_q[7];
+    assign fill_dest_q = graphics_word_q[7];
+    assign line_dest_q = graphics_word_q[7];
+    assign drav_dest_q = graphics_word_q[7];
+    assign pblt_color0_q = graphics_word_q[8];
+    assign pblt_color1_q = graphics_word_q[9];
+    assign pblt_dst_xy_raw_q = graphics_word_q[10];
+    assign pblt_wstart_q = graphics_word_q[11];
+    assign fill_wstart_q = graphics_word_q[11];
+    assign line_wstart_q = graphics_word_q[11];
+    assign pblt_wend_q = graphics_word_q[12];
+    assign fill_wend_q = graphics_word_q[12];
+    assign line_wend_q = graphics_word_q[12];
+    assign pblt_dx_q = graphics_half_q[0];
+    assign fill_dx_q = graphics_half_q[0];
+    assign line_b_q = graphics_half_q[0];
+    assign pblt_dy_q = graphics_half_q[1];
+    assign fill_dy_q = graphics_half_q[1];
+    assign line_a_q = graphics_half_q[1];
+    assign pblt_x_q = graphics_half_q[2];
+    assign fill_x_q = graphics_half_q[2];
+    assign pblt_y_q = graphics_half_q[3];
+    assign fill_y_q = graphics_half_q[3];
+    always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+      if (rst) begin
+        for (int i = 0; i < 13; i++) graphics_word_q[i] <= '0;
+        for (int i = 0; i < 4; i++) graphics_half_q[i] <= '0;
+        fill_substep_q   <= 1'b0;
+        fill_win_en_q    <= 1'b0;
+        fill_w2_q        <= 1'b0;
+        fill_w1_q        <= 1'b0;
+        pblt_substep_q  <= 2'd0;
+        pblt_win_en_q   <= 1'b0;
+        pblt_w2_q       <= 1'b0;
+        pblt_w1_q       <= 1'b0;
+        drav_substep_q <= 1'b0;
+        drav_w_q       <= 2'd0;
+        drav_inside_q  <= 1'b0;
+        line_substep_q <= 1'b0;
+        line_last_inside_q <= 1'b0;
+        line_aborted_q <= 1'b0;
+      end else begin
+        // FILL operands and sequencer state.
+        // EXECUTE: latch DADDR(port1)/DPTCH(port2)/DYDX(port3) for FILL. The
+        // start address (possibly XY-converted) is finalized at SETUP. Window
+        // clipping engages only for FILL XY with CONTROL.W = 3.
+        if (state_q == CORE_EXECUTE && is_fill) begin
+          graphics_word_q[2] <= rf_rs1_data;       // DADDR (linear, or XY for FILL XY)
+          graphics_word_q[1]     <= rf_rs2_data;       // DPTCH
+          graphics_half_q[0]        <= rf_rs3_data[15:0]; // DX
+          graphics_half_q[1]        <= rf_rs3_data[DATA_WIDTH-1:16]; // DY
+          graphics_half_q[2]         <= 16'd0;
+          graphics_half_q[3]         <= 16'd0;
+          fill_win_en_q    <= fill_is_xy &&
+                              (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd3);
+          fill_w2_q        <= fill_is_xy &&
+                              (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd2);
+          fill_w1_q        <= fill_is_xy &&
+                              (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd1);
+        end
+        // CORE_FILL_SETUP_WIN: latch WSTART(port1=B5)/WEND(port2=B6) for clip.
+        if (state_q == CORE_FILL_SETUP_WIN) begin
+          graphics_word_q[11] <= rf_rs1_data;
+          graphics_word_q[12]   <= rf_rs2_data;
+        end
+        // CORE_FILL_SETUP: latch COLOR1 (port1) and the linear start address
+        // (port3 = OFFSET for the XY conversion); start at the read sub-step.
+        if (state_q == CORE_FILL_SETUP) begin
+          graphics_word_q[6]    <= rf_rs1_data;        // COLOR1
+          graphics_word_q[3]     <= fill_start;
+          graphics_word_q[4] <= fill_start;
+          fill_substep_q  <= 1'b0;
+        end
+        // CORE_FILL: per pixel, read (sub-step 0) then write (sub-step 1).
+        if (state_q == CORE_FILL && mem_ack) begin
+          fill_substep_q <= ~fill_substep_q;
+          if (!fill_substep_q) begin
+            // Read ack: latch the destination pixel for processing.
+            graphics_word_q[7] <= mem_rdata_eff;
+          end else begin
+            // Write ack: advance to the next pixel (or to the final DADDR).
+            graphics_word_q[3] <= fill_addr_q + fill_psize_ext;
+            if (fill_row_end && !fill_done) begin
+              // Row complete (not the last): jump to the next row's base.
+              graphics_half_q[3]        <= fill_y_q + 16'd1;
+              graphics_word_q[4] <= fill_row_base_q + fill_dptch_q;
+              graphics_word_q[3]     <= fill_row_base_q + fill_dptch_q;
+              graphics_half_q[2]        <= 16'd0;
+            end else if (!fill_done) begin
+              graphics_half_q[2] <= fill_x_q + 16'd1;
+            end
+            // On fill_done the write ack leaves fill_addr_q at the pixel
+            // following the last (the final DADDR); the FSM moves to CORE_FILL_WB.
+          end
+        end
+        // PBLT operands and sequencer state.
+        // EXECUTE: latch SADDR(port1) / DADDR(port2) / DYDX(port3). Window
+        // clipping engages only for an XY destination with CONTROL.W=3; keep the
+        // raw XY DADDR (pblt_dst_addr_q is converted to linear at SETUP).
+        if (state_q == CORE_EXECUTE && is_pblt) begin
+          graphics_word_q[2] <= rf_rs1_data;          // SADDR
+          graphics_word_q[4]  <= rf_rs1_data;
+          graphics_word_q[3] <= rf_rs2_data;          // DADDR
+          graphics_word_q[5]  <= rf_rs2_data;
+          graphics_word_q[10] <= rf_rs2_data;        // raw XY DADDR (for window)
+          graphics_half_q[0]       <= rf_rs3_data[15:0];
+          graphics_half_q[1]       <= rf_rs3_data[DATA_WIDTH-1:16];
+          graphics_half_q[2]        <= 16'd0;
+          graphics_half_q[3]        <= 16'd0;
+          pblt_substep_q  <= 2'd0;
+          pblt_win_en_q   <= decoded.blt_dst_xy &&
+                             (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd3);
+          pblt_w2_q       <= decoded.blt_dst_xy &&
+                             (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd2);
+          pblt_w1_q       <= decoded.blt_dst_xy &&
+                             (io_control[CTRL_W_HI:CTRL_W_LO] == 2'd1);
+        end
+        // CORE_PBLT_SETUP_WIN: latch WSTART(port1=B5)/WEND(port2=B6) for clip.
+        if (state_q == CORE_PBLT_SETUP_WIN) begin
+          graphics_word_q[11] <= rf_rs1_data;
+          graphics_word_q[12]   <= rf_rs2_data;
+        end
+        // CORE_PBLT_SETUP: latch SPTCH(port1) / DPTCH(port2); for the XY variants
+        // convert the XY SADDR/DADDR to linear (port3 = OFFSET here).
+        if (state_q == CORE_PBLT_SETUP) begin
+          graphics_word_q[0] <= rf_rs1_data;
+          graphics_word_q[1] <= rf_rs2_data;
+          if (decoded.blt_src_xy) begin
+            graphics_word_q[2] <= pblt_src_conv;
+            graphics_word_q[4]  <= pblt_src_conv;
+          end
+          if (decoded.blt_dst_xy) begin
+            graphics_word_q[3] <= pblt_dst_conv;
+            graphics_word_q[5]  <= pblt_dst_conv;
+          end
+        end
+        // CORE_PBLT_SETUP2 (binary form): latch COLOR0(port1) / COLOR1(port2).
+        if (state_q == CORE_PBLT_SETUP2) begin
+          graphics_word_q[8] <= rf_rs1_data;
+          graphics_word_q[9] <= rf_rs2_data;
+        end
+        // CORE_PBLT: per pixel, read src (0) / read dst (1) / write (2).
+        if (state_q == CORE_PBLT && mem_ack) begin
+          if (pblt_substep_q == 2'd0) begin
+            graphics_word_q[6] <= mem_rdata_eff;
+            pblt_substep_q <= 2'd1;
+          end else if (pblt_substep_q == 2'd1) begin
+            graphics_word_q[7] <= mem_rdata_eff;
+            pblt_substep_q <= 2'd2;
+          end else begin
+            // Write ack: advance both pointers to the next pixel (source by 1
+            // bit for the binary form, PSIZE otherwise; dest always by PSIZE).
+            pblt_substep_q  <= 2'd0;
+            graphics_word_q[2] <= pblt_src_addr_q + pblt_src_step;
+            graphics_word_q[3] <= pblt_dst_addr_q + pblt_psize_ext;
+            if (pblt_done) begin
+              // P0009: on the FINAL pixel, leave SADDR/DADDR pointing at the START
+              // of the row PAST the array (base + DY*pitch) — matching the TMS34010
+              // UG / MAME, so consecutive PIXBLTs walk a sprite sheet. The row-end
+              // advance below was gated `!pblt_done`, which left SADDR at
+              // last-row-start + width, short by (pitch - width) bits. Measured on a
+              // Smash T.V. font glyph (SPTCH=8, width=6): SADDR came out 2 bits short
+              // of MAME (FFF55826 vs FFF55828).
+              graphics_word_q[2] <= pblt_src_row_q + pblt_sptch_q;
+              graphics_word_q[3] <= pblt_dst_row_q + pblt_dptch_q;
+            end else if (pblt_row_end) begin
+              graphics_half_q[3]        <= pblt_y_q + 16'd1;
+              graphics_word_q[4]  <= pblt_src_row_q + pblt_sptch_q;
+              graphics_word_q[5]  <= pblt_dst_row_q + pblt_dptch_q;
+              graphics_word_q[2] <= pblt_src_row_q + pblt_sptch_q;
+              graphics_word_q[3] <= pblt_dst_row_q + pblt_dptch_q;
+              graphics_half_q[2]        <= 16'd0;
+            end else begin
+              graphics_half_q[2] <= pblt_x_q + 16'd1;
+            end
+          end
+        end
+        // DRAV operands and sequencer state.
+        if (state_q == CORE_EXECUTE && is_drav) begin
+          graphics_word_q[2]      <= rf_rs2_data;        // Rd (XY dest)
+          graphics_word_q[0]      <= rf_rs1_data;        // Rs (XY increment)
+          graphics_word_q[3]  <= pix_xy_dst_linear;  // convert(Rd) + OFFSET (port3)
+          drav_substep_q <= 1'b0;
+          drav_w_q       <= io_control[CTRL_W_HI:CTRL_W_LO];
+        end
+        // CORE_DRAV_SETUP_WIN: latch the window test (WSTART=port1, WEND=port2).
+        if (state_q == CORE_DRAV_SETUP_WIN) drav_inside_q <= drav_in_window;
+        if (state_q == CORE_DRAV && mem_ack) begin
+          drav_substep_q <= ~drav_substep_q;
+          if (!drav_substep_q) graphics_word_q[7] <= mem_rdata_eff;  // read ack
+        end
+        // LINE operands and sequencer state.
+        // Clear the abort flag when a new LINE starts (at EXECUTE).
+        if (state_q == CORE_EXECUTE && is_line) line_aborted_q <= 1'b0;
+        if (state_q == CORE_LINE_SETUP_WIN) begin
+          graphics_word_q[11] <= rf_rs1_data;          // WSTART (B5)
+          graphics_word_q[12]   <= rf_rs2_data;          // WEND (B6)
+        end
+        if (state_q == CORE_LINE_SETUP1) begin
+          graphics_word_q[3]     <= rf_rs1_data;                 // d (B0)
+          graphics_half_q[0]     <= rf_rs2_data[DATA_WIDTH-1:16]; // b = DYDX minor
+          graphics_half_q[1]     <= rf_rs2_data[15:0];            // a = DYDX major
+          graphics_word_q[4] <= rf_rs3_data;                 // COUNT (B10)
+        end
+        if (state_q == CORE_LINE_SETUP2) begin
+          graphics_word_q[0]   <= rf_rs1_data;                // INC1 (B11)
+          graphics_word_q[1]   <= rf_rs2_data;                // INC2 (B12)
+          graphics_word_q[5] <= rf_rs3_data;                // OFFSET (B4)
+        end
+        if (state_q == CORE_LINE_SETUP3) begin
+          graphics_word_q[2]   <= rf_rs1_data;               // DADDR (B2)
+          graphics_word_q[6]   <= rf_rs2_data;               // COLOR1 (B9)
+          line_substep_q <= 1'b0;
+        end
+        if (state_q == CORE_LINE_DRAW && mem_ack) begin
+          line_substep_q <= ~line_substep_q;
+          if (!line_substep_q) begin
+            graphics_word_q[7] <= mem_rdata_eff;              // read ack
+          end else begin
+            // Write ack: record this pixel's window status (for the final V) and
+            // whether it triggered a W=1/W=2 abort, then advance the Bresenham
+            // state for the next pixel.
+            line_last_inside_q <= line_in_window;
+            if (line_abort) line_aborted_q <= 1'b1;
+            graphics_word_q[3]     <= line_d_next;
+            graphics_word_q[2] <= line_daddr_next;
+            graphics_word_q[4] <= line_count_next;
+          end
+        end
+      end
+    end
+  end endgenerate
+
+  // ---------------------------------------------------------------------------
+  // MMTM / MMFM iterator (shared)
+  //
+  // MMTM (push, INSTR_MMTM) and MMFM (pop, INSTR_MMFM) walk the same
+  // 16-bit register-list mask one set bit at a time, one 32-bit memory
+  // transaction per bit. They share this iterator state and differ only
+  // in scan direction, the +/-32 address step, and read-vs-write:
+  //
+  //   mm_mask_q (16-bit) shadows the original mask; the just-handled bit
+  //   is cleared after each mem_ack.
+  //   mm_rp_q (32-bit) is the working stack pointer / current transaction
+  //   address.
+  //   mm_iter_idx is the priority-encoded current bit:
+  //     - MMTM: LOWEST set bit  (lowest-order register saved first).
+  //     - MMFM: HIGHEST set bit (highest-order register restored first).
+  //   It indexes both the register file and the bit to clear after ack.
+  //
+  // Address sequencing (predecrement vs postincrement, per SPVU001A
+  // pages 12-111 / 12-109):
+  //   - MMTM: mm_rp_q seeds to (initial Rp - 32) so the first push lands
+  //     at Rp-32; it decrements by 32 after each ack EXCEPT the last, so
+  //     the final value (= initial - 32*count) is the lowest written
+  //     address, written back as the new Rp.
+  //   - MMFM: mm_rp_q seeds to (initial Rp) so the first read is at Rp;
+  //     it increments by 32 after EVERY ack including the last, so the
+  //     final value (= initial + 32*count) points one word past the data,
+  //     written back as the new Rp.
+  //
+  // Bit->register mapping (P0011, was assumption A0026): MMTM and MMFM use
+  // OPPOSITE mask bit orderings — verified against MAME's decoder (unidasm)
+  // on real Smash T.V. code, where a matching push/pop pair carries
+  // mirror-image list words (e.g. MMTM 0x8B00 / MMFM 0x00D1 both name
+  // {A0,A4,A6,A7}):
+  //   - MMFM: mask bit N = register R(N)      (direct;  SPVU001A p.12-109).
+  //   - MMTM: mask bit N = register R(15-N)   (reversed; SPVU001A p.12-111).
+  // The earlier "bit N = R(N) for both" (A0026) passed birdybro's
+  // round-trip TB (it only checks push-then-pop with the SAME word) but is
+  // wrong on real code, which pushes and pops the same registers with
+  // DIFFERENT (reversed) words. mm_iter_idx below is the selected MASK BIT;
+  // mm_reg_idx is the register it names (complemented for MMTM).
+  // ---------------------------------------------------------------------------
+  logic [DATA_WIDTH-1:0] mm_rp_q;
+  logic [15:0]           mm_mask_q;
+  logic [3:0]            mm_iter_idx;
+  logic [3:0]            mm_reg_idx;
+  logic                  mm_mask_will_be_empty;
+  logic                  is_mmtm, is_mmfm, is_mm;
+
+  assign is_mmtm = (decoded.iclass == INSTR_MMTM);
+  assign is_mmfm = (decoded.iclass == INSTR_MMFM);
+  assign is_mm   = is_mmtm || is_mmfm;
+
+  // Both MMTM and MMFM process the HIGHEST set mask bit first, one bit per
+  // memory transaction, clearing it after each ack (P0011). Highest-first is
+  // correct for both because their register maps are mirror images:
+  //   - MMFM (bit N = R(N)):    bit 15 = highest register, restored first
+  //     from the lowest stack address (postincrement).  MAME i=15..0.
+  //   - MMTM (bit N = R(15-N)): bit 15 = register R0, pushed first to the
+  //     highest stack address (predecrement).            MAME i=0..15.
+  always_comb begin
+    mm_iter_idx = 4'd0;
+    for (int i = 0; i < 16; i++) begin
+      if (mm_mask_q[i]) mm_iter_idx = 4'(i);   // last (highest) set bit wins
+    end
+  end
+  // Register named by the current mask bit: direct for MMFM, 15's-complement
+  // for MMTM (the reversed map). Drives read port 1 for the MMTM push.
+  assign mm_reg_idx = is_mmtm ? (4'd15 - mm_iter_idx) : mm_iter_idx;
+  // After we clear the bit at mm_iter_idx, will the mask be empty? Gates
+  // the FSM transition (last transaction → WRITEBACK) and, for MMTM,
+  // suppresses the final Rp-decrement.
+  assign mm_mask_will_be_empty = ((mm_mask_q & ~(16'd1 << mm_iter_idx)) == 16'd0);
+
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      mm_rp_q   <= '0;
+      mm_mask_q <= '0;
+    end else if (state_q == CORE_EXECUTE
+              && state_d == CORE_MEMORY
+              && is_mm) begin
+      // First entry to CORE_MEMORY: capture the mask and seed the
+      // working Rp. MMTM predecrements (first push at Rp-32); MMFM
+      // starts at Rp (first read at Rp).
+      mm_rp_q   <= is_mmtm ? (rf_rs2_data - WORD_BIT_SIZE) : rf_rs2_data;
+      mm_mask_q <= imm_lo_q;
+    end else if (state_q == CORE_MEMORY
+              && is_mm
+              && mem_ack) begin
+      mm_mask_q[mm_iter_idx] <= 1'b0;
+      if (is_mmfm) begin
+        // Post-increment after every read, including the last.
+        mm_rp_q <= mm_rp_q + WORD_BIT_SIZE;
+      end else if (!mm_mask_will_be_empty) begin
+        // Pre-decrement model: skip the step after the final push so the
+        // last write address remains as the new Rp.
+        mm_rp_q <= mm_rp_q - WORD_BIT_SIZE;
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // Immediate latch
+  //
+  // Long-immediate-form instructions (MOVI IW/IL, ADDI IW/IL, ...) fetch
+  // one or two additional 16-bit words after the opcode word. The
+  // imm_lo_q / imm_hi_q registers are DECLARED earlier (just before
+  // the branch_target_long block) so the assigns above can reference
+  // them under strict simulators like Questa; the always_ff that
+  // updates them sits here.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      imm_lo_q <= '0;
+      imm_hi_q <= '0;
+    end else begin
+      if (state_q == CORE_FETCH_IMM_LO && mem_ack) begin
+        imm_lo_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
+      end
+      if (state_q == CORE_FETCH_IMM_HI && mem_ack) begin
+        imm_hi_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
+      end
+      // P0014: DAddr of MOVE @,@ (fetched after SAddr).
+      if (state_q == CORE_FETCH_IMM2_LO && mem_ack) begin
+        imm2_lo_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
+      end
+      if (state_q == CORE_FETCH_IMM2_HI && mem_ack) begin
+        imm2_hi_q <= mem_rdata_eff[INSTR_WORD_WIDTH-1:0];
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // Datapath modules
+  //
+  // Control signals are now driven by `decoded.*` plus the FSM state:
+  // writes only happen in CORE_WRITEBACK, and only for instructions whose
+  // decoded record requests a writeback (decoded.wb_reg_en /
+  // decoded.wb_flags_en).
+  // ---------------------------------------------------------------------------
+
+  // Register-file ports.
+  reg_file_t              rf_rs1_file;
+  reg_idx_t               rf_rs1_idx;
+  reg_file_t              rf_rs2_file;
+  reg_idx_t               rf_rs2_idx;
+  reg_file_t              rf_rs3_file;
+  reg_idx_t               rf_rs3_idx;
+  logic                   rf_wr_en;
+  reg_file_t              rf_wr_file;
+  reg_idx_t               rf_wr_idx;
+  logic [DATA_WIDTH-1:0]  rf_wr_data;
+  logic [DATA_WIDTH-1:0]  rf_sp;
+
+  // ALU ports.
+  alu_op_t                alu_op;
+  logic [DATA_WIDTH-1:0]  alu_a;
+  logic [DATA_WIDTH-1:0]  alu_b;
+  logic                   alu_cin;
+  logic [DATA_WIDTH-1:0]  alu_result;
+  alu_flags_t             alu_flags;
+
+  // Status-register ports.
+  logic                   st_flag_update_en;
+  logic                   st_write_en;
+  logic [DATA_WIDTH-1:0]  st_write_data;
+  logic [DATA_WIDTH-1:0]  st_value;
+  logic                   st_n, st_c, st_z, st_v;
+
+  // Shifter ports.
+  logic [DATA_WIDTH-1:0]  shifter_result;
+  alu_flags_t             shifter_flags;
+
+  // ---- Operand assembly ----------------------------------------------------
+  // Full 32-bit immediate composed from the latched 16-bit pieces. For
+  // IW form: sign-extend (or zero-extend) imm_lo_q. For IL form (Task
+  // 0013): concatenate {imm_hi_q, imm_lo_q}.
+  logic [DATA_WIDTH-1:0] imm32;
+  always_comb begin
+    if (decoded.needs_imm32) begin
+      imm32 = {imm_hi_q, imm_lo_q};
+    end else if (decoded.imm_sign_extend) begin
+      imm32 = {{(DATA_WIDTH-INSTR_WORD_WIDTH){imm_lo_q[INSTR_WORD_WIDTH-1]}}, imm_lo_q};
+    end else begin
+      imm32 = {{(DATA_WIDTH-INSTR_WORD_WIDTH){1'b0}}, imm_lo_q};
+    end
+  end
+
+  // ---- Register-file selectors driven by decode ----------------------------
+  // rs1 reads Rs (used as ALU `a` for reg-reg ops). rs2 reads Rd (used as
+  // ALU `b` for reg-reg ops where Rd is also a source, e.g. ADD Rs,Rd).
+  // For MOVI / MOVK, the rs1/rs2 reads still occur but their values are
+  // not routed to alu_a/b (the alu_b mux picks imm32 or zero-extended k5
+  // instead).
+  //
+  // TMS34010 reg-reg encoding constrains Rs and Rd to the same file, so
+  // a single `decoded.rd_file` drives both reads.
+  // Read-port 1 normally reads from the destination file (reg-reg ops
+  // are same-file). MOVE Rs,Rd is the one cross-file exception: Rs may
+  // live in the opposite file from Rd, so it uses decoded.rs_file.
+  // FILL reads its implied B-file operands across two cycles via the three
+  // read ports: at EXECUTE — DADDR(B2) on port1, DPTCH(B3) on port2,
+  // DYDX(B7) on port3; at CORE_FILL_SETUP — COLOR1(B9) on port1.
+  assign is_fill    = (decoded.iclass == INSTR_FILL_L) || (decoded.iclass == INSTR_FILL_XY);
+  assign fill_is_xy = (decoded.iclass == INSTR_FILL_XY);
+  // PIXBLT reads its 5 implied B-file operands across two cycles: at EXECUTE —
+  // SADDR(B0) on port1, DADDR(B2) on port2, DYDX(B7) on port3; at
+  // CORE_PBLT_SETUP — SPTCH(B1) on port1, DPTCH(B3) on port2.
+  assign is_pblt    = (decoded.iclass == INSTR_PIXBLT_LL);
+  // DRAV: at EXECUTE — Rs on port1, Rd on port2, OFFSET(B4) on port3 (for the
+  // XY->linear conversion of Rd); in CORE_DRAV — COLOR1(B9) on port1.
+  assign is_drav    = (decoded.iclass == INSTR_DRAV);
+  // LINE: 3 setup cycles read the implied B operands —
+  //   SETUP1: d(B0)/DYDX(B7)/COUNT(B10);  SETUP2: INC1(B11)/INC2(B12)/OFFSET(B4);
+  //   SETUP3: DADDR(B2)/COLOR1(B9).  All reads are from the B file.
+  assign is_line    = (decoded.iclass == INSTR_LINE);
+  logic line_rd_b;   // LINE is doing B-file setup reads this cycle
+  assign line_rd_b  = is_line && ((state_q == CORE_LINE_SETUP1)
+                               || (state_q == CORE_LINE_SETUP2)
+                               || (state_q == CORE_LINE_SETUP3)
+                               || (state_q == CORE_LINE_SETUP_WIN));
+
+  assign rf_rs1_file = line_rd_b ? REG_FILE_B
+                     : (state_q == CORE_PIXT_SETUP_WIN) ? REG_FILE_B
+                     : (is_drav && ((state_q == CORE_DRAV) || (state_q == CORE_DRAV_SETUP_WIN))) ? REG_FILE_B
+                     : (is_fill || is_pblt) ? REG_FILE_B
+                     : (decoded.iclass == INSTR_MOVE_RR) ? decoded.rs_file
+                     : decoded.rd_file;
+  // Read-port 1 index is normally decoded.rs_idx. MMTM repurposes it
+  // during CORE_MEMORY to scan the register list — rf_rs1_idx then
+  // points at the current register being pushed, and rf_rs1_data
+  // becomes the 32-bit value driven onto mem_wdata.
+  assign rf_rs1_idx  = is_fill ? ((state_q == CORE_FILL_SETUP_WIN) ? CPW_WSTART_IDX
+                                : (state_q == CORE_FILL_SETUP) ? B_COLOR1_IDX : B_DADDR_IDX)
+                     : is_pblt ? ((state_q == CORE_PBLT_SETUP_WIN) ? CPW_WSTART_IDX
+                                : (state_q == CORE_PBLT_SETUP2) ? B_COLOR0_IDX
+                                : (state_q == CORE_PBLT_SETUP)  ? B_SPTCH_IDX : B_SADDR_IDX)
+                     : (state_q == CORE_MEMORY && is_mmtm) ? mm_reg_idx
+                     : (is_drav && (state_q == CORE_DRAV_SETUP_WIN)) ? CPW_WSTART_IDX // WSTART
+                     : (is_drav && (state_q == CORE_DRAV)) ? B_COLOR1_IDX  // COLOR1 for the draw
+                     : (is_line && (state_q == CORE_LINE_SETUP1)) ? B_SADDR_IDX   // d (B0)
+                     : (is_line && (state_q == CORE_LINE_SETUP2)) ? B_INC1_IDX    // INC1 (B11)
+                     : (is_line && (state_q == CORE_LINE_SETUP3)) ? B_DADDR_IDX   // DADDR (B2)
+                     : (is_line && (state_q == CORE_LINE_SETUP_WIN)) ? CPW_WSTART_IDX // WSTART (B5)
+                     : (state_q == CORE_PIXT_SETUP_WIN) ? CPW_WSTART_IDX           // PIXT WSTART
+                     : decoded.rs_idx;
+  // Read port 2 normally reads Rd. CPW repurposes it (Rd is not a source
+  // for CPW) to read the window-start register WSTART = B5; read port 3
+  // reads the window-end register WEND = B6. Both are fixed B-file
+  // registers per SPVU001A page 12-57. FILL: B3 (DPTCH) / B7 (DYDX).
+  // PIXBLT: DADDR(B2) at EXECUTE, DPTCH(B3) at SETUP.
+  assign rf_rs2_file = (line_rd_b || is_fill || is_pblt || (decoded.iclass == INSTR_CPW)
+                        || (state_q == CORE_PIXT_SETUP_WIN)
+                        || (is_drav && (state_q == CORE_DRAV_SETUP_WIN)))
+                     ? REG_FILE_B : decoded.rd_file;
+  assign rf_rs2_idx  = is_fill ? ((state_q == CORE_FILL_SETUP_WIN) ? CPW_WEND_IDX : B_DPTCH_IDX)
+                     : is_pblt ? ((state_q == CORE_PBLT_SETUP_WIN) ? CPW_WEND_IDX
+                                : (state_q == CORE_PBLT_SETUP2) ? B_COLOR1_IDX
+                                : (state_q == CORE_PBLT_SETUP)  ? B_DPTCH_IDX : B_DADDR_IDX)
+                     : (is_drav && (state_q == CORE_DRAV_SETUP_WIN)) ? CPW_WEND_IDX  // WEND
+                     : (is_line && (state_q == CORE_LINE_SETUP1)) ? B_DYDX_IDX    // DYDX (B7)
+                     : (is_line && (state_q == CORE_LINE_SETUP2)) ? B_INC2_IDX    // INC2 (B12)
+                     : (is_line && (state_q == CORE_LINE_SETUP3)) ? B_COLOR1_IDX  // COLOR1 (B9)
+                     : (is_line && (state_q == CORE_LINE_SETUP_WIN)) ? CPW_WEND_IDX // WEND (B6)
+                     : (state_q == CORE_PIXT_SETUP_WIN) ? CPW_WEND_IDX             // PIXT WEND
+                     : (decoded.iclass == INSTR_CPW) ? CPW_WSTART_IDX : decoded.rd_idx;
+  // Read port 3: CPW reads WEND (B6); DIVU/DIVS (even Rd) read the low half
+  // of the 64-bit dividend, Rd+1; CVXYL/XY-PIXT read OFFSET (B4); FILL/PIXBLT
+  // read DYDX (B7) at EXECUTE. Otherwise unused.
+  assign rf_rs3_file = ((decoded.iclass == INSTR_DIVU) || (decoded.iclass == INSTR_DIVS))
+                     ? decoded.rd_file : REG_FILE_B;
+  assign rf_rs3_idx  = ((decoded.iclass == INSTR_DIVU) || (decoded.iclass == INSTR_DIVS))
+                     ? (decoded.rd_idx + 4'd1)
+                     : is_fill ? ((state_q == CORE_FILL_SETUP) ? B_OFFSET_IDX : B_DYDX_IDX)
+                     : is_pblt ? ((state_q == CORE_PBLT_SETUP) ? B_OFFSET_IDX : B_DYDX_IDX)
+                     : (is_line && (state_q == CORE_LINE_SETUP1)) ? B_COUNT_IDX   // COUNT (B10)
+                     : (is_line && (state_q == CORE_LINE_SETUP2)) ? B_OFFSET_IDX  // OFFSET (B4)
+                     : ((decoded.iclass == INSTR_CVXYL) || decoded.xy_addr || is_drav) ? B_OFFSET_IDX
+                     : CPW_WEND_IDX;
+
+  // DSJ-family runtime gate. For DSJEQ/DSJNE, the decrement (and any
+  // subsequent jump) happens only if the Z bit pre-condition holds:
+  //   - DSJ:   unconditional   → gate = 1
+  //   - DSJEQ: gated on Z=1    → gate = st_z
+  //   - DSJNE: gated on Z=0    → gate = !st_z
+  // For non-DSJ instructions this signal is irrelevant; we default
+  // it to 1 so it doesn't interfere with their writebacks.
+  logic dsj_precondition;
+  always_comb begin
+    unique case (decoded.iclass)
+      INSTR_DSJ,
+      INSTR_DSJS:   dsj_precondition = 1'b1;
+      INSTR_DSJEQ:  dsj_precondition = st_z;
+      INSTR_DSJNE:  dsj_precondition = !st_z;
+      default:      dsj_precondition = 1'b1;
+    endcase
+  end
+
+  // "Will Rd be zero after the decrement?" — needed for the DSJ
+  // branch decision. alu_result at WRITEBACK is the decremented Rd
+  // (when iclass is one of the DSJ family).
+  logic dsj_rd_nonzero;
+  assign dsj_rd_nonzero = (alu_result != '0);
+
+  // Writeback enable is a one-cycle pulse, gated by the FSM state.
+  // Writeback data and flag-input come from either the ALU or the
+  // shifter depending on `decoded.use_shifter`. For DSJEQ/DSJNE the
+  // dsj_precondition further gates the write: if Z doesn't match the
+  // pre-condition the spec mandates Rd is left unchanged.
+  // MMFM writes a popped register on every CORE_MEMORY ack (mem_rdata_eff is
+  // valid in the same cycle mem_ack asserts). This is a second user of
+  // the single regfile write port, active in CORE_MEMORY rather than
+  // CORE_WRITEBACK; the final-Rp write still happens at WRITEBACK below.
+  // Rp is never in the list (spec: "unpredictable results"), so the two
+  // writes never target the same index.
+  logic mmfm_pop_wr;
+  assign mmfm_pop_wr = (state_q == CORE_MEMORY) && is_mmfm && mem_ack;
+
+  // ---- Indirect MOVE addressing + auto inc/dec (Task 0059/0060) -----------
+  // Pointer register: Rd for stores (rf_rs2), Rs for loads (rf_rs1). The
+  // memory address is the pointer (postinc/none) or pointer-32 (predec);
+  // the post-update pointer value is pointer±32 (FS=32). For LOAD inc/dec
+  // the updated pointer is written to Rs during CORE_MEMORY (a second
+  // regfile-write user, like mmfm_pop_wr); the data write to Rd happens at
+  // WRITEBACK, so when Rs==Rd the data wins (SPVU001A 12-143).
+  logic                  is_mv_store, is_mv_load;
+  logic                  mv_postinc, mv_predec, mv_incdec;
+  logic [DATA_WIDTH-1:0] mv_ptr, mv_addr, mv_ptr_new;
+  logic                  mv_load_ptr_wr;
+  assign is_mv_store = (decoded.iclass == INSTR_MOVE_FIELD_STORE);
+  assign is_mv_load  = (decoded.iclass == INSTR_MOVE_FIELD_LOAD);
+  assign mv_postinc  = (decoded.move_mode == MV_ADDR_POSTINC);
+  assign mv_predec   = (decoded.move_mode == MV_ADDR_PREDEC);
+  assign mv_incdec   = mv_postinc || mv_predec;
+  assign mv_ptr      = is_mv_store ? rf_rs2_data : rf_rs1_data;
+  assign mv_load_ptr_wr = (state_q == CORE_MEMORY) && is_mv_load
+                       && mv_incdec && mem_ack;
+
+  // ---- MOVE field-size machinery (Task 0077) ------------------------------
+  // The F bit (instr_word_q[9]) selects the FS0/FE0 (0) or FS1/FE1 (1) pair
+  // in ST. FS=0 encodes a 32-bit field. Field stores write the low FS bits
+  // (the memory model does the read-modify-write); field loads extend the
+  // FS-bit field to 32 bits per FE (1 = sign-extend, 0 = zero-extend).
+  // Indirect pointers auto-step by ±FS, not the old hardcoded ±32.
+  logic [4:0]            mv_fs_raw;
+  logic [FIELD_SIZE_WIDTH-1:0] mv_fs;       // actual field size 1..32
+  logic                  mv_fe;             // 1 = sign-extend on load
+  logic [DATA_WIDTH-1:0] mv_fs_ext;         // FS zero-extended to the pointer width
+  logic [DATA_WIDTH-1:0] mv_fmask;
+  logic [DATA_WIDTH-1:0] mv_load_data; // extended captured operand, valid at WRITEBACK
+  assign mv_fs_raw = instr_word_q[9] ? st_value[ST_FS1_HI:ST_FS1_LO]
+                                     : st_value[ST_FS0_HI:ST_FS0_LO];
+  // MOVB (decoded.force_byte) forces an 8-bit field and sign-extension on
+  // load. PIXT (decoded.force_pixel) forces the field size to the PSIZE I/O
+  // register value and zero-extension on load. Both override ST.FS/FE.
+  assign mv_fs     = decoded.force_byte   ? FIELD_SIZE_WIDTH'(8)
+                   : decoded.force_pixel  ? io_psize[FIELD_SIZE_WIDTH-1:0]
+                   : (mv_fs_raw == 5'd0)  ? FIELD_SIZE_WIDTH'(DATA_WIDTH)
+                                          : {1'b0, mv_fs_raw};
+  assign mv_fe     = decoded.force_byte   ? 1'b1   // MOVB: sign-extend
+                   : decoded.force_pixel  ? 1'b0   // PIXT: zero-extend
+                   : (instr_word_q[9] ? st_value[ST_FE1_BIT] : st_value[ST_FE0_BIT]);
+  assign mv_fs_ext = DATA_WIDTH'(mv_fs);
+  assign mv_fmask  = (mv_fs >= FIELD_SIZE_WIDTH'(DATA_WIDTH))
+                   ? '1 : ((32'd1 << mv_fs) - 32'd1);
+  always_comb begin
+    if (mv_fs >= FIELD_SIZE_WIDTH'(DATA_WIDTH)) begin
+      mv_load_data = mv_load_data_q;
+    end else if (mv_fe && mv_load_data_q[mv_fs - 6'd1]) begin
+      mv_load_data = mv_load_data_q | ~mv_fmask;
+    end else begin
+      mv_load_data = mv_load_data_q & mv_fmask;
+    end
+  end
+
+  // Capture the raw operand on exactly the original acknowledgement edge.
+  // The existing register name/CE contract is retained for timing constraints.
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      mv_load_data_q <= '0;
+    end else if (state_q == CORE_MEMORY && mem_ack
+                 && (decoded.iclass == INSTR_MOVE_FIELD_LOAD
+                     || decoded.iclass == INSTR_MOVE_ABS_LOAD
+                     || decoded.iclass == INSTR_MOVE_OFF_LOAD)) begin
+      mv_load_data_q <= mem_rdata_eff;
+    end
+  end
+
+  // PIXT store pixel-write engine (Tasks 0089/0090/0091). A PIXT store is a
+  // 2-step CORE_MEMORY read-modify-write: step 0 reads the destination pixel
+  // (pix_dest_q), step 1 writes the result. The result combines three CONTROL
+  // features, all confined to the PSIZE-bit pixel by mv_fmask:
+  //   1. Pixel processing (PPOP, CONTROL[14:10]): processed = f(src, dest).
+  //      The 16 Boolean codes are implemented (pixel-size-independent); the 6
+  //      arithmetic codes (0x10-0x15) are not yet implemented and fall back to
+  //      replace (documented limitation).
+  //   2. Transparency (CONTROL.T, bit 5): if enabled and the PROCESSED pixel
+  //      is 0, the destination is left unchanged (write the old value back —
+  //      memory cycles still occur, per the spec).
+  //   3. Plane mask (PMASK): a 1 bit protects that plane:
+  //      merged = (processed & ~pmask) | (dest & pmask).
+  // `pixt_rmw` selects this path; a regular MOVE store (no force_pixel) stays
+  // a single write.
+  logic [DATA_WIDTH-1:0] pixt_pmask_field;
+  logic [DATA_WIDTH-1:0] pixt_processed; // PPOP(src, dest)
+  logic                  pixt_transp;    // transparency inhibits this write
+  logic [DATA_WIDTH-1:0] pixt_merged;    // value written at step 1
+  // Arithmetic-PPOP operands: the PSIZE-bit pixels as unsigned values, and
+  // the unsigned add. Arith ops are only defined for pixels of 4/8/16 bits
+  // (SPVU001A); they are computed for all sizes (1/2-bit results are
+  // spec-Undefined, so any value is acceptable).
+  assign pixt_rmw         = decoded.force_pixel && is_mv_store;
+  assign pixt_pmask_field = {{(DATA_WIDTH-16){1'b0}}, io_pmask} & mv_fmask;
+  assign pixt_processed   = ppop_apply(rf_rs1_data, pix_dest_q,
+                                       io_control[CTRL_PPOP_HI:CTRL_PPOP_LO], mv_fmask);
+  assign pixt_transp  = io_control[CTRL_T_BIT] && ((pixt_processed & mv_fmask) == '0);
+  // Per-pixel window check for an XY PIXT store (Task 0117), mirroring DRAV.
+  // WSTART/WEND are read at CORE_PIXT_SETUP_WIN; the pointer's XY (mv_ptr) is
+  // tested. Drawn for W=0, or W=2/W=3 when inside; W=1 never draws. V (W!=0) =
+  // NOT inside; WVP on a W=1 hit (inside) or W=2 miss (outside). Gated by
+  // pixt_xy_win so a regular MOVE / non-XY PIXT / W=0 PIXT is unaffected.
+  logic [DATA_WIDTH-1:0] pixt_wstart_q, pixt_wend_q;
+  logic                  pixt_in_window, pixt_clip_out;
+  assign pixt_xy_win  = pixt_rmw && decoded.xy_addr
+                     && (io_control[CTRL_W_HI:CTRL_W_LO] != 2'd0);
+  assign pixt_in_window = SHARED_WINDOW ? shared_window_inside :
+        (mv_ptr[15:0] >= pixt_wstart_q[15:0]) && (mv_ptr[15:0] <= pixt_wend_q[15:0])
+     && (mv_ptr[DATA_WIDTH-1:16] >= pixt_wstart_q[DATA_WIDTH-1:16])
+     && (mv_ptr[DATA_WIDTH-1:16] <= pixt_wend_q[DATA_WIDTH-1:16]);
+  // W=1 never draws; W=2/W=3 draw inside.
+  assign pixt_clip_out = pixt_xy_win &&
+                         ((io_control[CTRL_W_HI:CTRL_W_LO] == 2'd1) || !pixt_in_window);
+  assign pixt_merged  = SHARED_PIXEL ? shared_pixel_result : (pixt_transp || pixt_clip_out)
+                      ? pix_dest_q
+                      : ((pixt_processed & ~pixt_pmask_field) | (pix_dest_q & pixt_pmask_field));
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      pixt_wstart_q <= '0;
+      pixt_wend_q   <= '0;
+      pixt_inside_q <= 1'b0;
+    end else begin
+      if (state_q == CORE_PIXT_SETUP_WIN) begin
+        pixt_wstart_q <= rf_rs1_data;   // WSTART (B5)
+        pixt_wend_q   <= rf_rs2_data;   // WEND (B6)
+      end
+      // Latch the pointer's window status at the RMW write step (for the
+      // final V / WVP written at CORE_WRITEBACK).
+      if ((state_q == CORE_MEMORY) && pixt_rmw && (mem_op_step == 2'd1) && mem_ack)
+        pixt_inside_q <= pixt_in_window;
+    end
+  end
+
+  // Window operations are disjoint consumers of the same four unsigned
+  // comparisons. Rectangle tests use their two corners; a point repeats one
+  // corner. Hit detection exchanges the corners, testing overlap instead of
+  // containment. FILL/PIXBLT share the coordinate offset adders as well.
+  logic [31:0] window_start, window_end, window_point;
+  logic [31:0] window_array_origin;
+  logic [15:0] window_dx, window_dy, window_col, window_row;
+  logic [15:0] window_x0, window_y0, window_x1, window_y1;
+  logic [15:0] window_calc_x, window_calc_y;
+  logic window_is_array, window_corner_test, window_hit_test;
+  always_comb begin
+    window_start = pixt_wstart_q;
+    window_end = pixt_wend_q;
+    window_point = mv_ptr;
+    window_array_origin = pblt_dst_xy_raw_q;
+    window_dx = pblt_dx_q;
+    window_dy = pblt_dy_q;
+    window_col = pblt_x_q;
+    window_row = pblt_y_q;
+    window_is_array = is_fill || is_pblt;
+    window_corner_test = state_q == CORE_FILL_SETUP_WIN || state_q == CORE_FILL_WIN_HIT
+                      || state_q == CORE_PBLT_SETUP_WIN || state_q == CORE_PBLT_WIN_HIT;
+    window_hit_test = state_q == CORE_FILL_WIN_HIT || state_q == CORE_PBLT_WIN_HIT;
+    if (is_fill) begin
+      window_start = fill_wstart_q;
+      window_end = fill_wend_q;
+      window_array_origin = fill_daddr_raw_q;
+      window_dx = fill_dx_q;
+      window_dy = fill_dy_q;
+      window_col = fill_x_q;
+      window_row = fill_y_q;
+    end else if (is_pblt) begin
+      window_start = pblt_wstart_q;
+      window_end = pblt_wend_q;
+    end else if (is_line) begin
+      window_start = line_wstart_q;
+      window_end = line_wend_q;
+      window_point = line_daddr_q;
+    end else if (is_drav) begin
+      window_start = rf_rs1_data;
+      window_end = rf_rs2_data;
+      window_point = drav_rd_q;
+    end
+    if (state_q == CORE_FILL_SETUP_WIN || state_q == CORE_PBLT_SETUP_WIN) begin
+      window_start = rf_rs1_data;
+      window_end = rf_rs2_data;
+    end
+    window_calc_x = window_array_origin[15:0]
+                  + (window_corner_test ? (window_dx - 16'd1) : window_col);
+    window_calc_y = window_array_origin[31:16]
+                  + (window_corner_test ? (window_dy - 16'd1) : window_row);
+    window_x0 = window_point[15:0];
+    window_x1 = window_point[15:0];
+    window_y0 = window_point[31:16];
+    window_y1 = window_point[31:16];
+    if (window_is_array) begin
+      window_x0 = window_corner_test ? window_array_origin[15:0] : window_calc_x;
+      window_y0 = window_corner_test ? window_array_origin[31:16] : window_calc_y;
+      window_x1 = window_calc_x;
+      window_y1 = window_calc_y;
+    end
+  end
+  assign shared_window_inside =
+      ((window_hit_test ? window_x1 : window_x0) >= window_start[15:0])
+   && ((window_hit_test ? window_x0 : window_x1) <= window_end[15:0])
+   && ((window_hit_test ? window_y1 : window_y0) >= window_start[31:16])
+   && ((window_hit_test ? window_y0 : window_y1) <= window_end[31:16]);
+
+  // XY-addressed PIXT: the pointer holds an XY value; convert it to a linear
+  // bit address (same shift form as CVXYL). CONVDP for a destination pointer
+  // (store), CONVSP for a source pointer (load). OFFSET = B4 (read port 3).
+  logic [15:0]           pix_xy_conv;
+  logic [4:0]            pix_xy_yshift;
+  logic [DATA_WIDTH-1:0] pix_xy_linear;
+  assign pix_xy_conv   = is_mv_store ? io_convdp : io_convsp;
+  assign pix_xy_yshift = 5'd31 - pix_xy_conv[4:0];
+  always_comb begin
+    unique case (io_psize[4:0])
+      5'd1:    pix_xy_xsh = 5'd0;
+      5'd2:    pix_xy_xsh = 5'd1;
+      5'd4:    pix_xy_xsh = 5'd2;
+      5'd8:    pix_xy_xsh = 5'd3;
+      5'd16:   pix_xy_xsh = 5'd4;
+      default: pix_xy_xsh = 5'd0;
+    endcase
+  end
+  assign pix_xy_linear = SHARED_XY ? shared_xy0_result : (({{16{mv_ptr[DATA_WIDTH-1]}}, mv_ptr[DATA_WIDTH-1:16]} << pix_xy_yshift)
+                          | ({16'b0, mv_ptr[15:0]} << pix_xy_xsh))
+                         + rf_rs3_data;   // + OFFSET (B4)
+
+  assign mv_addr     = decoded.xy_addr ? pix_xy_linear
+                     : mv_predec       ? (SHARED_ADDRESS ? shared_address_sum : (mv_ptr - mv_fs_ext)) : mv_ptr;
+  assign mv_ptr_new  = SHARED_ADDRESS ? shared_address_sum : mv_predec ? (mv_ptr - mv_fs_ext) : (mv_ptr + mv_fs_ext);
+
+  // Destination-pointer XY conversion (for the XY-to-XY PIXT M2M, Task 0086).
+  // pix_xy_linear above converts the SOURCE pointer (mv_ptr = rf_rs1 for the
+  // M2M) with CONVSP; the M2M destination (rf_rs2) converts with CONVDP.
+  logic [4:0]            pix_xy_dst_yshift;
+  assign pix_xy_dst_yshift = 5'd31 - io_convdp[4:0];
+  assign pix_xy_dst_linear =
+      SHARED_XY ? shared_xy1_result : (({{16{rf_rs2_data[DATA_WIDTH-1]}}, rf_rs2_data[DATA_WIDTH-1:16]} << pix_xy_dst_yshift)
+       | ({16'b0, rf_rs2_data[15:0]} << pix_xy_xsh))
+      + rf_rs3_data;   // + OFFSET (B4)
+
+  // ---- Indirect-to-indirect MOVE auto inc/dec (Task 0062) -----------------
+  // Two pointers (Rs=source, Rd=dest) both step by ±32. The source pointer
+  // (Rs) is written during CORE_MEMORY at the step-0 (read) ack; the
+  // destination pointer (Rd) is written at WRITEBACK. The step-1 (write)
+  // address uses rf_rs2_data, which — when Rs==Rd — already reflects the
+  // step-0 Rs update, so a postincrement Rs==Rd writes to the incremented
+  // location (SPVU001A 12-138). To avoid double-stepping that one register,
+  // the WRITEBACK Rd write is suppressed when Rs==Rd.
+  logic                  is_mv_m2m, m2m_same_reg, m2m_src_wr;
+  logic [DATA_WIDTH-1:0] m2m_src_addr, m2m_dst_addr, m2m_src_new, m2m_dst_new;
+  assign is_mv_m2m    = (decoded.iclass == INSTR_MOVE_FIELD_M2M);
+  assign m2m_same_reg = (decoded.rs_idx == decoded.rd_idx);
+  // Field-size aware (Task 0079): both pointers step by ±FS, not ±32. XY PIXT
+  // M2M (Task 0086): the pointers hold XY values — convert the source with
+  // CONVSP (pix_xy_linear) and the destination with CONVDP (pix_xy_dst_linear).
+  assign m2m_src_addr = decoded.xy_addr ? pix_xy_linear
+                      : mv_predec       ? (SHARED_ADDRESS ? shared_address_sum : (rf_rs1_data - mv_fs_ext)) : rf_rs1_data;
+  assign m2m_dst_addr = decoded.xy_addr ? pix_xy_dst_linear
+                      : mv_predec       ? (SHARED_ADDRESS ? shared_address_sum : (rf_rs2_data - mv_fs_ext)) : rf_rs2_data;
+  assign m2m_src_new  = SHARED_ADDRESS ? shared_address_sum : mv_predec ? (rf_rs1_data - mv_fs_ext) : (rf_rs1_data + mv_fs_ext);
+  assign m2m_dst_new  = SHARED_ADDRESS ? shared_address_sum : mv_predec ? (rf_rs2_data - mv_fs_ext) : (rf_rs2_data + mv_fs_ext);
+  // Update the source pointer Rs at the step-0 read ack (inc/dec M2M only).
+  assign m2m_src_wr   = (state_q == CORE_MEMORY) && is_mv_m2m && mv_incdec
+                     && (mem_op_step == 2'd0) && mem_ack;
+
+  // Pointer updates, offset accesses and relative branches consume one
+  // address calculation at a time. MOVE M2M selects Rs at its first memory
+  // step and Rd at its second step/writeback; this retains the Rs==Rd alias
+  // behavior because the source write has already happened at that point.
+  logic [DATA_WIDTH-1:0] address_a, address_b;
+  logic address_subtract;
+  always_comb begin
+    address_a = rf_rs1_data;
+    address_b = mv_fs_ext;
+    address_subtract = mv_predec;
+    case (decoded.iclass)
+      INSTR_MOVE_FIELD_STORE: address_a = rf_rs2_data;
+      INSTR_MOVE_FIELD_M2M:
+        address_a = (state_q == CORE_MEMORY && mem_op_step == 2'd0)
+                  ? rf_rs1_data : rf_rs2_data;
+      INSTR_MOVE_OFF_STORE: begin
+        address_a = rf_rs2_data;
+        address_b = imm32;
+        address_subtract = 1'b0;
+      end
+      INSTR_MOVE_OFF_LOAD: begin
+        address_b = imm32;
+        address_subtract = 1'b0;
+      end
+      INSTR_MOVE_OFF_M2M: begin
+        address_a = mem_op_step == 2'd0 ? rf_rs1_data : rf_rs2_data;
+        address_b = mem_op_step == 2'd0 ? imm32 : imm2_off_sext;
+        address_subtract = 1'b0;
+      end
+      INSTR_MOVE_OFF_M2M_POST: begin
+        address_a = state_q == CORE_WRITEBACK ? rf_rs2_data : rf_rs1_data;
+        address_b = state_q == CORE_WRITEBACK ? mv_fs_ext : imm32;
+        address_subtract = 1'b0;
+      end
+      INSTR_MOVE_ABS_M2M_POST: begin
+        address_a = rf_rs2_data;
+        address_subtract = 1'b0;
+      end
+      INSTR_JRCC_SHORT: begin
+        address_a = pc_value;
+        address_b = DATA_WIDTH'(disp_signed_12);
+        address_subtract = 1'b0;
+      end
+      INSTR_JRCC_LONG, INSTR_DSJ, INSTR_DSJEQ, INSTR_DSJNE, INSTR_CALLR: begin
+        address_a = pc_value;
+        address_b = DATA_WIDTH'(disp_signed_20);
+        address_subtract = 1'b0;
+      end
+      INSTR_DSJS: begin
+        address_a = pc_value;
+        address_b = DATA_WIDTH'(dsjs_disp_bits);
+        address_subtract = 1'b0;
+      end
+      default: begin end
+    endcase
+  end
+  assign shared_address_sum = address_a + (address_b ^ {DATA_WIDTH{address_subtract}})
+                            + DATA_WIDTH'(address_subtract);
+
+  // FILL writes the final DADDR back to B2 in CORE_FILL_WB; PIXBLT writes the
+  // final SADDR (B0) in CORE_PBLT_WB and the final DADDR (B2) in CORE_PBLT_WB2.
+  logic fill_wb, pblt_wb_saddr, pblt_wb_daddr, graphics_wb;
+  assign fill_wb       = (state_q == CORE_FILL_WB);
+  assign pblt_wb_saddr = (state_q == CORE_PBLT_WB);
+  assign pblt_wb_daddr = (state_q == CORE_PBLT_WB2);
+  // LINE writebacks: d -> B0, DADDR -> B2, COUNT -> B10, one per cycle.
+  logic line_wb_d, line_wb_daddr, line_wb_count, line_wb;
+  assign line_wb_d     = (state_q == CORE_LINE_WB_D);
+  assign line_wb_daddr = (state_q == CORE_LINE_WB_DADDR);
+  assign line_wb_count = (state_q == CORE_LINE_WB_COUNT);
+  assign line_wb       = line_wb_d || line_wb_daddr || line_wb_count;
+  assign graphics_wb   = fill_wb || pblt_wb_saddr || pblt_wb_daddr || line_wb;
+  // Interrupt-entry SP writeback: at CORE_INT_DONE, SP <- SP-64 (two 32-bit
+  // pushes done). Only when context was actually pushed (an NMI with NMIM=1
+  // saves nothing, so SP is unchanged). Highest-priority regfile write.
+  logic int_sp_wb;
+  assign int_sp_wb = (state_q == CORE_INT_DONE) && int_push_q;
+  assign rf_wr_en   = ((state_q == CORE_WRITEBACK)
+                       && decoded.wb_reg_en
+                       && dsj_precondition
+                       && !(is_mv_m2m && m2m_same_reg)   // Rs==Rd: Rs write already covered it
+                       && !(is_div && div_v))            // divide overflow: leave Rd unchanged
+                   || mmfm_pop_wr
+                   || mv_load_ptr_wr
+                   || m2m_src_wr
+                   || graphics_wb
+                   || int_sp_wb;
+  assign rf_wr_file = int_sp_wb ? REG_FILE_A
+                    : graphics_wb ? REG_FILE_B : decoded.rd_file;
+  assign rf_wr_idx  = int_sp_wb ? REG_SP_IDX
+                    : line_wb_count              ? B_COUNT_IDX
+                    : (fill_wb || pblt_wb_daddr || line_wb_daddr) ? B_DADDR_IDX
+                    : (pblt_wb_saddr || line_wb_d) ? B_SADDR_IDX  // LINE d -> B0
+                    : mmfm_pop_wr                ? mm_iter_idx
+                    : (mv_load_ptr_wr || m2m_src_wr) ? decoded.rs_idx  // update pointer Rs
+                    : ((is_mpy || is_div) && pair_wb_step) ? (decoded.rd_idx + 4'd1)  // pair low/rem -> Rd+1
+                                                     : decoded.rd_idx;
+  // EXGF (Exchange Field Definition) datapath. Per SPVU001A page 12-77:
+  // Rd's low 6 bits swap with the F-selected FE:FS pair (1 + 5 bits)
+  // in ST. Rd's upper 26 bits are cleared after the swap.
+  //
+  // Because the regfile is async-read, rf_rs2_data delivers the OLD
+  // Rd value during the same CORE_WRITEBACK cycle that writes the
+  // new value — so a single-cycle atomic swap is straightforward.
+  logic [4:0]            exgf_cur_fs;
+  logic                  exgf_cur_fe;
+  logic [DATA_WIDTH-1:0] exgf_new_rd;
+  logic [DATA_WIDTH-1:0] exgf_new_st;
+  assign exgf_cur_fs = instr_word_q[9] ? st_value[ST_FS1_HI:ST_FS1_LO]
+                                       : st_value[ST_FS0_HI:ST_FS0_LO];
+  assign exgf_cur_fe = instr_word_q[9] ? st_value[ST_FE1_BIT]
+                                       : st_value[ST_FE0_BIT];
+  assign exgf_new_rd = {{(DATA_WIDTH-6){1'b0}}, exgf_cur_fe, exgf_cur_fs};
+  always_comb begin
+    exgf_new_st = st_value;
+    if (instr_word_q[9]) begin
+      exgf_new_st[ST_FS1_HI:ST_FS1_LO] = rf_rs2_data[4:0];
+      exgf_new_st[ST_FE1_BIT]          = rf_rs2_data[5];
+    end else begin
+      exgf_new_st[ST_FS0_HI:ST_FS0_LO] = rf_rs2_data[4:0];
+      exgf_new_st[ST_FE0_BIT]          = rf_rs2_data[5];
+    end
+  end
+
+  // ---- ADDXY / SUBXY datapath (XY-coordinate arithmetic) ------------------
+  // Treat each register as two 16-bit halves: X = low 16, Y = high 16.
+  // ADDXY/SUBXY operate on the halves independently, with NO carry/borrow
+  // propagating between them. Rd is both a source and the destination;
+  // rf_rs2_data delivers the old Rd, rf_rs1_data the Rs operand.
+  //   ADDXY (SPVU001A 12-41):  N=(Xres==0), V=Xres[15], Z=(Yres==0), C=Yres[15].
+  //   SUBXY (SPVU001A 12-252): compare-style flags — N=(RsX==RdX),
+  //     V=(RsX>RdX), Z=(RsY==RdY), C=(RsY>RdY), using signed XY.
+  logic [15:0] xy_rs_x, xy_rs_y, xy_rd_x, xy_rd_y;
+  logic [15:0] xy_x_add, xy_y_add, xy_x_sub, xy_y_sub;
+  logic [DATA_WIDTH-1:0] addxy_result, subxy_result;
+  alu_flags_t            addxy_flags, subxy_flags;
+  assign xy_rs_x = rf_rs1_data[15:0];
+  assign xy_rs_y = rf_rs1_data[DATA_WIDTH-1:16];
+  assign xy_rd_x = rf_rs2_data[15:0];
+  assign xy_rd_y = rf_rs2_data[DATA_WIDTH-1:16];
+  assign xy_x_add = SHARED_XY_ARITH ? shared_xy_arith_result[15:0] : xy_rd_x + xy_rs_x;     // 16-bit, carry dropped
+  assign xy_y_add = SHARED_XY_ARITH ? shared_xy_arith_result[31:16] : xy_rd_y + xy_rs_y;
+  assign xy_x_sub = SHARED_XY_ARITH ? shared_xy_arith_result[15:0] : xy_rd_x - xy_rs_x;     // Rd - Rs per spec
+  assign xy_y_sub = SHARED_XY_ARITH ? shared_xy_arith_result[31:16] : xy_rd_y - xy_rs_y;
+  assign addxy_result = {xy_y_add, xy_x_add};
+  assign subxy_result = {xy_y_sub, xy_x_sub};
+  assign addxy_flags = '{n: (xy_x_add == 16'd0), c: xy_y_add[15],
+                          z: (xy_y_add == 16'd0), v: xy_x_add[15]};
+  // X/Y are signed 16-bit screen coordinates.  Hangtime f603 proves that
+  // RsX=0, RdX=FFE0h (-32) sets V and the following JRV must branch.
+  assign subxy_flags = '{n: (xy_x_sub == 16'd0),
+                          c: ($signed(xy_rd_y) < $signed(xy_rs_y)),
+                          z: (xy_y_sub == 16'd0),
+                          v: ($signed(xy_rd_x) < $signed(xy_rs_x))};
+  // CMPXY (SPVU001A 12-55): nondestructive; flags use the SIGN bits of the
+  // per-half subtract results (NOT the signed comparison SUBXY uses).
+  alu_flags_t cmpxy_flags;
+  assign cmpxy_flags = '{n: (xy_x_sub == 16'd0), c: xy_y_sub[15],
+                          z: (xy_y_sub == 16'd0), v: xy_x_sub[15]};
+
+  // ADDXY/SUBXY/CMPXY, DRAV and LINE need the same independent half-word
+  // arithmetic, in mutually exclusive instruction classes. Select inputs
+  // before the adders; suppress the carry between X and Y exactly as before.
+  logic [31:0] xy_arith_a, xy_arith_b;
+  logic xy_arith_subtract;
+  always_comb begin
+    xy_arith_a = rf_rs2_data;
+    xy_arith_b = rf_rs1_data;
+    xy_arith_subtract = decoded.iclass == INSTR_SUBXY || decoded.iclass == INSTR_CMPXY;
+    if (is_drav) begin
+      xy_arith_a = drav_rd_q;
+      xy_arith_b = drav_rs_q;
+    end else if (is_line) begin
+      xy_arith_a = line_daddr_q;
+      xy_arith_b = line_branch ? line_inc1_q : line_inc2_q;
+    end
+  end
+  assign shared_xy_arith_result[15:0] = xy_arith_a[15:0]
+      + (xy_arith_b[15:0] ^ {16{xy_arith_subtract}}) + 16'(xy_arith_subtract);
+  assign shared_xy_arith_result[31:16] = xy_arith_a[31:16]
+      + (xy_arith_b[31:16] ^ {16{xy_arith_subtract}}) + 16'(xy_arith_subtract);
+
+  // ---- CPW (Compare Point to Window) datapath (SPVU001A 12-57) ------------
+  // Compare the XY point in Rs (rf_rs1) against the window corners
+  // WSTART = B5 (rf_rs2, overridden above) and WEND = B6 (rf_rs3). X = low
+  // 16 signed, Y = high 16 signed. The 4-bit out-of-window code lands in
+  // Rd[8:5]; all other bits 0. V = 1 iff the point is outside the window
+  // (any code bit set); N/C/Z Unaffected (masked off by wb_flag_mask).
+  logic [15:0] cpw_pt_x, cpw_pt_y, cpw_ws_x, cpw_ws_y, cpw_we_x, cpw_we_y;
+  logic        cpw_b5, cpw_b6, cpw_b7, cpw_b8;
+  logic [DATA_WIDTH-1:0] cpw_result;
+  alu_flags_t  cpw_flags;
+  assign cpw_pt_x = rf_rs1_data[15:0];
+  assign cpw_pt_y = rf_rs1_data[DATA_WIDTH-1:16];
+  assign cpw_ws_x = rf_rs2_data[15:0];        // WSTART.X (B5)
+  assign cpw_ws_y = rf_rs2_data[DATA_WIDTH-1:16];
+  assign cpw_we_x = rf_rs3_data[15:0];        // WEND.X   (B6)
+  assign cpw_we_y = rf_rs3_data[DATA_WIDTH-1:16];
+  assign cpw_b5 = ($signed(cpw_ws_x) > $signed(cpw_pt_x));  // WSTART.X > Rs.X
+  assign cpw_b6 = ($signed(cpw_pt_x) > $signed(cpw_we_x));  // Rs.X > WEND.X
+  assign cpw_b7 = ($signed(cpw_ws_y) > $signed(cpw_pt_y));  // WSTART.Y > Rs.Y
+  assign cpw_b8 = ($signed(cpw_pt_y) > $signed(cpw_we_y));  // Rs.Y > WEND.Y
+  assign cpw_result = {{(DATA_WIDTH-9){1'b0}}, cpw_b8, cpw_b7, cpw_b6, cpw_b5, 5'b0};
+  assign cpw_flags  = '{n: 1'b0, c: 1'b0, z: 1'b0,
+                         v: (cpw_b5 | cpw_b6 | cpw_b7 | cpw_b8)};
+
+  // ---- CVXYL (convert XY address to linear) datapath -----------------------
+  // SPVU001A page 12-59: linear = [(Y << ydp_shift) OR (X << xsh)] + OFFSET.
+  // X = Rs[15:0] (positive), Y = Rs[31:16] (signed). The screen pitch and
+  // pixel size are powers of two, so the multiplies are shifts: the Y shift
+  // is 31 - CONVDP[4:0] (CONVDP encodes the destination pitch as a shift; e.g.
+  // CONVDP=0x14 -> shift 11 -> pitch 2^11), and the X shift is log2(PSIZE).
+  // OFFSET (B-file B4, on read port 3) is the linear address of XY origin.
+  logic [4:0]            cvxyl_ydp_shift;
+  logic [4:0]            cvxyl_xsh;
+  logic [DATA_WIDTH-1:0] cvxyl_ypart, cvxyl_xpart, cvxyl_result;
+  assign cvxyl_ydp_shift = 5'd31 - io_convdp[4:0];
+  always_comb begin
+    unique case (io_psize[4:0])
+      5'd1:    cvxyl_xsh = 5'd0;
+      5'd2:    cvxyl_xsh = 5'd1;
+      5'd4:    cvxyl_xsh = 5'd2;
+      5'd8:    cvxyl_xsh = 5'd3;
+      5'd16:   cvxyl_xsh = 5'd4;
+      default: cvxyl_xsh = 5'd0;   // PSIZE not a power of two in 1..16: undefined
+    endcase
+  end
+  // Sign-extend Y (signed) to 32 bits before the shift; X is positive.
+  assign cvxyl_ypart  = {{16{rf_rs1_data[DATA_WIDTH-1]}}, rf_rs1_data[DATA_WIDTH-1:16]}
+                        << cvxyl_ydp_shift;
+  assign cvxyl_xpart  = {16'b0, rf_rs1_data[15:0]} << cvxyl_xsh;
+  assign cvxyl_result = SHARED_XY ? shared_xy0_result : (cvxyl_ypart | cvxyl_xpart) + rf_rs3_data;   // + OFFSET (B4)
+
+  // Pocket area reduction: graphics engines are mutually exclusive states.
+  // Select operands before the arithmetic, sharing five pixel processors.
+  // Only the active engine consumes shared_pixel_result; legacy expressions
+  // remain selectable for cycle-by-cycle regression comparisons.
+  logic [DATA_WIDTH-1:0] shared_pixel_src, shared_pixel_dst, shared_pixel_mask;
+  logic [DATA_WIDTH-1:0] shared_pixel_processed, shared_pixel_pmask, shared_pixel_result;
+  logic shared_pixel_clip, shared_pixel_transp;
+  always_comb begin
+    shared_pixel_src = rf_rs1_data;
+    shared_pixel_dst = pix_dest_q;
+    shared_pixel_mask = mv_fmask;
+    shared_pixel_clip = pixt_clip_out;
+    case (state_q)
+      CORE_FILL: begin
+        shared_pixel_src = fill_color_q;
+        shared_pixel_dst = fill_dest_q;
+        shared_pixel_mask = fill_pixel_mask;
+        shared_pixel_clip = fill_clip_out;
+      end
+      CORE_PBLT: begin
+        shared_pixel_src = pblt_src_eff;
+        shared_pixel_dst = pblt_dst_pix_q;
+        shared_pixel_mask = pblt_pixel_mask;
+        shared_pixel_clip = pblt_clip_out;
+      end
+      CORE_DRAV: begin
+        shared_pixel_dst = drav_dest_q;
+        shared_pixel_mask = drav_pixel_mask;
+        shared_pixel_clip = 1'b0;
+      end
+      CORE_LINE_DRAW: begin
+        shared_pixel_src = line_color_q;
+        shared_pixel_dst = line_dest_q;
+        shared_pixel_mask = line_pixel_mask;
+        shared_pixel_clip = line_clip_out;
+      end
+      default: begin end
+    endcase
+  end
+  assign shared_pixel_processed = ppop_apply(shared_pixel_src, shared_pixel_dst,
+      io_control[CTRL_PPOP_HI:CTRL_PPOP_LO], shared_pixel_mask);
+  assign shared_pixel_pmask = {{(DATA_WIDTH-16){1'b0}}, io_pmask} & shared_pixel_mask;
+  assign shared_pixel_transp = io_control[CTRL_T_BIT]
+                            && ((shared_pixel_processed & shared_pixel_mask) == '0);
+  assign shared_pixel_result = (shared_pixel_transp || shared_pixel_clip)
+      ? shared_pixel_dst
+      : ((shared_pixel_processed & ~shared_pixel_pmask)
+         | (shared_pixel_dst & shared_pixel_pmask));
+
+  // Seven XY conversions share two datapaths without adding cycles. PIXBLT
+  // SETUP consumes both source and destination conversions on the same edge;
+  // PIXT M2M likewise retains independent source/destination address signals.
+  // FILL, LINE and CVXYL borrow the first datapath in their consuming states.
+  logic [DATA_WIDTH-1:0] shared_xy0_raw, shared_xy1_raw, shared_xy0_offset;
+  logic [DATA_WIDTH-1:0] shared_xy0_result, shared_xy1_result;
+  logic [4:0] shared_xy0_yshift;
+  always_comb begin
+    shared_xy0_raw = mv_ptr;
+    shared_xy1_raw = rf_rs2_data;
+    shared_xy0_offset = rf_rs3_data;
+    shared_xy0_yshift = pix_xy_yshift;
+    if (decoded.iclass == INSTR_CVXYL) begin
+      shared_xy0_raw = rf_rs1_data;
+      shared_xy0_yshift = 5'd31 - io_convdp[4:0];
+    end
+    case (state_q)
+      CORE_FILL_SETUP: begin
+        shared_xy0_raw = fill_daddr_raw_q;
+        shared_xy0_yshift = 5'd31 - io_convdp[4:0];
+      end
+      CORE_PBLT_SETUP: begin
+        shared_xy0_raw = pblt_src_addr_q;
+        shared_xy1_raw = pblt_dst_addr_q;
+        shared_xy0_yshift = 5'd31 - io_convsp[4:0];
+      end
+      CORE_LINE_DRAW: begin
+        shared_xy0_raw = line_daddr_q;
+        shared_xy0_offset = line_offset_q;
+        shared_xy0_yshift = 5'd31 - io_convdp[4:0];
+      end
+      default: begin end
+    endcase
+  end
+  assign shared_xy0_result =
+      (({{16{shared_xy0_raw[DATA_WIDTH-1]}}, shared_xy0_raw[DATA_WIDTH-1:16]} << shared_xy0_yshift)
+       | ({16'b0, shared_xy0_raw[15:0]} << pix_xy_xsh)) + shared_xy0_offset;
+  assign shared_xy1_result =
+      (({{16{shared_xy1_raw[DATA_WIDTH-1]}}, shared_xy1_raw[DATA_WIDTH-1:16]} << (5'd31 - io_convdp[4:0]))
+       | ({16'b0, shared_xy1_raw[15:0]} << pix_xy_xsh)) + rf_rs3_data;
+
+  // ---- MPYS / MPYU multiply datapath (SPVU001A 12-164/12-166) -------------
+  // Rd (rf_rs2) is the 32-bit multiplicand, Rs (rf_rs1) the multiplier — an
+  // FS1-bit field (FS1=0 means 32, the whole Rs). The 64-bit product is
+  // latched in CORE_EXECUTE (mpy_product_q — the registered output for DSP
+  // inference) and written back over 1 cycle (odd Rd: low 32 to Rd) or 2
+  // cycles (even Rd: hi 32 to Rd, then lo 32 to Rd+1). pair_wb_step (shared
+  // with DIVU) selects the second pass.
+  logic signed [63:0]    mpy_sprod;
+  logic        [63:0]    mpy_uprod, mpy_product, mpy_product_q;
+  assign is_mpy      = (decoded.iclass == INSTR_MPYS) || (decoded.iclass == INSTR_MPYU);
+  assign mpy_signed  = (decoded.iclass == INSTR_MPYS);
+  assign mpy_rd_even = (decoded.rd_idx[0] == 1'b0);
+  // Variable multiplier width: extract the low FS1 bits of Rs and
+  // sign-extend (MPYS) or zero-extend (MPYU) to 32 bits before the multiply;
+  // Rd (the multiplicand) stays full 32-bit.
+  logic [4:0]            mpy_fs1;
+  logic [DATA_WIDTH-1:0] mpy_fmask;
+  logic [DATA_WIDTH-1:0] mpy_rs_field;
+  assign mpy_fs1   = st_value[ST_FS1_HI:ST_FS1_LO];
+  assign mpy_fmask = (32'd1 << mpy_fs1) - 32'd1;   // FS1 1..31; FS1=0 uses full Rs below
+  always_comb begin
+    if (mpy_fs1 == 5'd0) begin
+      mpy_rs_field = rf_rs1_data;                                    // FS1 = 32
+    end else if (mpy_signed && rf_rs1_data[mpy_fs1 - 5'd1]) begin
+      mpy_rs_field = (rf_rs1_data & mpy_fmask) | ~mpy_fmask;         // MPYS sign-extend
+    end else begin
+      mpy_rs_field = rf_rs1_data & mpy_fmask;                        // zero-extend / positive
+    end
+  end
+  // 64-bit-context products: operands sign/zero-extend to 64 then multiply.
+  assign mpy_sprod   = $signed(rf_rs2_data) * $signed(mpy_rs_field);
+  assign mpy_uprod   = rf_rs2_data * mpy_rs_field;
+  assign mpy_product = mpy_signed ? unsigned'(mpy_sprod) : mpy_uprod;
+
+  // ---- DIVU divide datapath (SPVU001A 12-69) -----------------------------
+  // Multi-cycle restoring divider runs in CORE_DIVIDE. Even Rd: 64-bit
+  // dividend {Rd, Rd+1} (Rd+1 read via port 3) -> quotient in Rd, remainder
+  // in Rd+1. Odd Rd: 32-bit dividend Rd -> quotient in Rd. On overflow
+  // (divisor 0 or quotient > 32 bits) the result is NOT written; only V is
+  // set. The product/quotient pair-writeback to {Rd, Rd+1} is shared with
+  // MPY via pair_wb_step.
+  // is_div = the whole divide family (DIVU/MODU/DIVS/MODS) — anything that
+  // runs the multi-cycle divider via CORE_DIVIDE. The divider itself is
+  // unsigned; for the signed variants the core feeds |operands| and
+  // sign-conditions the results.
+  logic                  is_signed_div, is_div_mod, div_rd_even, div_use_pair;
+  logic [2*DATA_WIDTH-1:0] div_dividend;
+  logic [DATA_WIDTH-1:0]   div_divisor, div_quotient, div_remainder;
+  logic                    div_start, div_busy, div_done, div_overflow;
+  assign is_divu       = (decoded.iclass == INSTR_DIVU);
+  assign is_modu       = (decoded.iclass == INSTR_MODU);
+  assign is_divs       = (decoded.iclass == INSTR_DIVS);
+  assign is_mods       = (decoded.iclass == INSTR_MODS);
+  assign is_div        = is_divu || is_modu || is_divs || is_mods;
+  assign is_signed_div = is_divs || is_mods;
+  assign is_div_mod    = is_modu || is_mods;        // remainder result (vs quotient)
+  assign div_rd_even   = (decoded.rd_idx[0] == 1'b0);
+  // Only DIVU/DIVS with an even Rd use the 64-bit {Rd, Rd+1} dividend; the
+  // MOD ops and odd-Rd divides use the 32-bit {0/sext, Rd} dividend.
+  assign div_use_pair  = (is_divu || is_divs) && div_rd_even;
+
+  // Operand signs (signed variants only) and magnitudes fed to the divider.
+  // The combinational signs drive the divider-input abs at CORE_EXECUTE;
+  // the LATCHED signs (_q, captured at the divide start) drive the result
+  // sign-conditioning at WRITEBACK — by then Rd may already hold the
+  // quotient (even-Rd pass 0), so its live MSB is no longer the dividend's.
+  logic div_dvd_sign, div_dvs_sign, div_result_neg;
+  logic div_dvd_sign_q, div_dvs_sign_q;
+  assign div_dvd_sign = is_signed_div && rf_rs2_data[DATA_WIDTH-1];   // Rd MSB
+  assign div_dvs_sign = is_signed_div && rf_rs1_data[DATA_WIDTH-1];   // Rs MSB
+  assign div_result_neg = div_dvd_sign_q ^ div_dvs_sign_q;            // quotient sign
+
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      div_dvd_sign_q <= 1'b0;
+      div_dvs_sign_q <= 1'b0;
+    end else if (state_q == CORE_EXECUTE && is_div) begin
+      div_dvd_sign_q <= div_dvd_sign;
+      div_dvs_sign_q <= div_dvs_sign;
+    end
+  end
+
+  logic [DATA_WIDTH-1:0]   rd_abs;
+  logic [2*DATA_WIDTH-1:0] raw64, abs64;
+  assign rd_abs = rf_rs2_data[DATA_WIDTH-1] ? (~rf_rs2_data + 1'b1) : rf_rs2_data;
+  assign raw64  = {rf_rs2_data, rf_rs3_data};
+  assign abs64  = rf_rs2_data[DATA_WIDTH-1] ? (~raw64 + 1'b1) : raw64;
+  always_comb begin
+    if (!is_signed_div)
+      div_dividend = div_use_pair ? raw64 : {{DATA_WIDTH{1'b0}}, rf_rs2_data};
+    else if (div_use_pair)
+      div_dividend = abs64;                                // |{Rd, Rd+1}|
+    else
+      div_dividend = {{DATA_WIDTH{1'b0}}, rd_abs};         // {0, |Rd|}
+  end
+  assign div_divisor = div_dvs_sign ? (~rf_rs1_data + 1'b1) : rf_rs1_data;
+
+  // One-cycle start pulse as we leave CORE_EXECUTE for CORE_DIVIDE; the
+  // divider latches the operands on that edge.
+  assign div_start = (state_q == CORE_EXECUTE) && is_div;
+
+  tms34010_divider u_divider (
+    .clk       (clk),
+    .ce_cpu    (ce_cpu),
+    .rst       (rst),
+    .start     (div_start),
+    .dividend  (div_dividend),
+    .divisor   (div_divisor),
+    .busy      (div_busy),
+    .done      (div_done),
+    .quotient  (div_quotient),
+    .remainder (div_remainder),
+    .overflow  (div_overflow)
+  );
+
+  // Sign-condition the magnitude results, and compute the divide-family
+  // result/flags. div_quot_out/div_rem_out are the (possibly negated)
+  // values; div_result_main is what the flags/Z reflect.
+  logic [DATA_WIDTH-1:0] div_quot_out, div_rem_out, div_result_main;
+  assign div_quot_out = div_result_neg  ? (~div_quotient  + 1'b1) : div_quotient;
+  assign div_rem_out  = div_dvd_sign_q  ? (~div_remainder + 1'b1) : div_remainder;
+  assign div_result_main = is_div_mod ? div_rem_out : div_quot_out;
+  // Signed overflow: the magnitude quotient must fit a signed 32-bit value.
+  //   positive result: |q| >= 2^31  -> overflow
+  //   negative result: |q| >  2^31  -> overflow (|q|==2^31 is -2^31, valid)
+  // (div_overflow already covers Rs=0 and |q| >= 2^32.)
+  assign div_signed_ovf = div_overflow
+    || (is_signed_div &&
+        (div_result_neg ? (div_quotient[DATA_WIDTH-1] && (div_quotient[DATA_WIDTH-2:0] != '0))
+                        :  div_quotient[DATA_WIDTH-1]));
+  assign div_v = is_signed_div ? div_signed_ovf : div_overflow;
+
+  // ---- Pair writeback step (shared MPY-even / DIVU-even) ------------------
+  // Ops that write the {Rd, Rd+1} register pair over two WRITEBACK cycles.
+  // pair_wb_step selects the second pass (Rd+1). DIVU on overflow writes
+  // nothing, so it is not a pair-writeback op then.
+  assign is_pair_wb = (is_mpy && mpy_rd_even)
+                   || (div_use_pair && !div_v);   // DIVU/DIVS even (not MOD; not on overflow)
+  assign pair_second_pass = is_pair_wb && (pair_wb_step == 1'b0);
+
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      mpy_product_q <= '0;
+      pair_wb_step  <= 1'b0;
+    end else begin
+      if (state_q == CORE_EXECUTE && is_mpy) begin
+        mpy_product_q <= mpy_product;
+      end
+      // Step 0 -> 1 only while we hold in WRITEBACK for the second pass.
+      if (state_q == CORE_WRITEBACK) begin
+        pair_wb_step <= pair_second_pass ? 1'b1 : 1'b0;
+      end else begin
+        pair_wb_step <= 1'b0;
+      end
+    end
+  end
+
+  // SEXT / ZEXT field-extension datapath. Per SPVU001A pages 12-238
+  // (SEXT) and 12-256 (ZEXT): take the low `FS` bits of Rd, then
+  // either sign-extend (copy the field MSB into bits[31:FS]) or
+  // zero-extend (clear bits[31:FS]). FS is read from the F-selected
+  // pair in ST (FS0 if instr_word_q[9]=0, FS1 if =1). FS=5'b00000
+  // encodes a field-size of 32 per Table 5-3, so the data is the
+  // full 32-bit register and no extension is needed.
+  logic [4:0]            fs_selected;
+  logic [DATA_WIDTH-1:0] field_mask;
+  logic                  field_msb;
+  logic [DATA_WIDTH-1:0] sext_result;
+  logic [DATA_WIDTH-1:0] zext_result;
+  assign fs_selected = instr_word_q[9]
+                     ? st_value[ST_FS1_HI:ST_FS1_LO]
+                     : st_value[ST_FS0_HI:ST_FS0_LO];
+  always_comb begin
+    if (fs_selected == 5'd0) begin
+      // Field-size = 32: identity.
+      field_mask  = '1;
+      field_msb   = rf_rs2_data[DATA_WIDTH-1];
+      sext_result = rf_rs2_data;
+      zext_result = rf_rs2_data;
+    end else begin
+      field_mask  = (32'd1 << fs_selected) - 32'd1;
+      field_msb   = rf_rs2_data[fs_selected - 5'd1];
+      sext_result = field_msb ? ((rf_rs2_data & field_mask) | ~field_mask)
+                              :  (rf_rs2_data & field_mask);
+      zext_result = rf_rs2_data & field_mask;
+    end
+  end
+
+  // LMO (Leftmost-One) datapath. Pure combinational — finds the
+  // highest-set bit of rf_rs1_data and computes Rd = 31 - bit_pos
+  // (i.e., one's-complement of the bit position in 5 bits). The
+  // upper 27 bits of Rd are zero. If rf_rs1_data == 0, Rd = 0 and
+  // the Z flag (gated by wb_flag_mask) is set.
+  logic [4:0]            lmo_bit_pos;
+  logic [DATA_WIDTH-1:0] lmo_result;
+  always_comb begin
+    // Iterate low-to-high so the LAST overwrite (highest set bit)
+    // wins. Synthesizable — no `break`, no run-time loop.
+    lmo_bit_pos = 5'd0;
+    for (int i = 0; i < DATA_WIDTH; i++) begin
+      if (rf_rs1_data[i]) lmo_bit_pos = 5'(i);
+    end
+    if (rf_rs1_data == '0)
+      lmo_result = '0;
+    else
+      lmo_result = {{(DATA_WIDTH-5){1'b0}}, ~lmo_bit_pos};
+  end
+
+  // Regfile write-data mux. Several "Rd ← something" instructions
+  // bypass the ALU/shifter and route a different source:
+  //   GETST  → ST value
+  //   GETPC  → current PC value
+  //   EXGPC  → current PC value (the other half of the swap)
+  //   REV    → chip-revision constant (A0025)
+  //   LMO_RR → priority-encoder result
+  // The default routes the shifter or ALU result per decoded.use_shifter.
+  always_comb begin
+    if (int_sp_wb) begin
+      // Interrupt entry: SP <- SP - 64 (two 32-bit pushes complete).
+      rf_wr_data = rf_sp - WORD_BIT_SIZE_2;
+    end else
+    unique case (decoded.iclass)
+      // MOVX: Rd.X (low 16) <- Rs.X, Rd.Y (high 16) kept. MOVY: Rd.Y <-
+      // Rs.Y, Rd.X kept. rf_rs1=Rs, rf_rs2=old Rd (async read, same cycle).
+      INSTR_MOVX:   rf_wr_data = {rf_rs2_data[DATA_WIDTH-1:16], rf_rs1_data[15:0]};
+      INSTR_MOVY:   rf_wr_data = {rf_rs1_data[DATA_WIDTH-1:16], rf_rs2_data[15:0]};
+      INSTR_ADDXY:  rf_wr_data = addxy_result;
+      INSTR_SUBXY:  rf_wr_data = subxy_result;
+      INSTR_DRAV:   rf_wr_data = drav_advance;   // Rd advanced by Rs (XY add)
+      INSTR_CPW:    rf_wr_data = cpw_result;
+      // MPYS/MPYU: even Rd -> hi32 then (Rd+1) lo32; odd Rd -> lo32.
+      INSTR_MPYS,
+      INSTR_MPYU:   rf_wr_data = mpy_rd_even
+                               ? (pair_wb_step ? mpy_product_q[31:0] : mpy_product_q[63:32])
+                               : mpy_product_q[31:0];
+      // DIVU: even Rd -> quotient (pass 0), remainder -> Rd+1 (pass 1);
+      // odd Rd -> quotient. (Skipped entirely on overflow via rf_wr_en.)
+      // DIVU/DIVS: even Rd -> quotient (pass 0), remainder -> Rd+1 (pass 1);
+      // odd Rd -> quotient. div_quot_out/div_rem_out are sign-conditioned
+      // (identity for the unsigned variants).
+      INSTR_DIVU,
+      INSTR_DIVS:   rf_wr_data = (div_rd_even && pair_wb_step) ? div_rem_out
+                                                              : div_quot_out;
+      // MODU/MODS: the remainder of Rd mod Rs -> Rd (single writeback).
+      INSTR_MODU,
+      INSTR_MODS:   rf_wr_data = div_rem_out;
+      INSTR_GETST:  rf_wr_data = st_value;
+      INSTR_MMTM:   rf_wr_data = mm_rp_q;       // final Rp = address of last push
+      // MMFM: per-iteration pop writes mem_rdata_eff to the popped register;
+      // the WRITEBACK pass writes final Rp (= initial + 32*count).
+      INSTR_MMFM:   rf_wr_data = mmfm_pop_wr ? mem_rdata_eff : mm_rp_q;
+      // MOVE *Rs,Rd: Rd <- the 32 bits read from mem[Rs]. The value is
+      // latched into mv_load_data_q at the CORE_MEMORY ack (mem_rdata_eff
+      // itself is long gone by WRITEBACK — this core prefetches the next
+      // opcode, so the bus has moved on one cycle later).
+      // Store inc/dec writes the auto-updated pointer back to Rd at
+      // WRITEBACK (plain store has wb_reg_en=0, so this is unused there).
+      INSTR_MOVE_FIELD_STORE: rf_wr_data = mv_ptr_new;
+      // Load: at WRITEBACK -> the latched field-extended data to Rd; during
+      // CORE_MEMORY (inc/dec) -> the updated pointer to Rs.
+      INSTR_MOVE_FIELD_LOAD: rf_wr_data = mv_load_ptr_wr ? mv_ptr_new : mv_load_data;
+      // Indirect-to-indirect inc/dec: source pointer Rs (step-0 ack) or
+      // destination pointer Rd (WRITEBACK).
+      INSTR_MOVE_FIELD_M2M: rf_wr_data = m2m_src_wr ? m2m_src_new : m2m_dst_new;
+      // MOVE @SAddr,Rd: Rd <- the field-extended value read from the
+      // absolute address. MOVE *Rs(off),Rd: same, from the offset address.
+      // Extend the captured operand; the live memory bus is no longer used.
+      INSTR_MOVE_ABS_LOAD,
+      INSTR_MOVE_OFF_LOAD:  rf_wr_data = mv_load_data;
+      INSTR_MOVE_OFF_M2M_POST,
+      INSTR_MOVE_ABS_M2M_POST: rf_wr_data = SHARED_ADDRESS ? shared_address_sum : rf_rs2_data + mv_fs_ext;
+      INSTR_CVXYL:  rf_wr_data = cvxyl_result;
+      INSTR_FILL_L,
+      INSTR_FILL_XY: rf_wr_data = fill_addr_q;  // final (linear) DADDR -> B2 (CORE_FILL_WB)
+      // P0010: for an XY destination, PIXBLT leaves DADDR as an XY address (the
+      // start of the row below the array = {ystart+DY, xstart}), NOT the internal
+      // linear address it was converted to at SETUP. Measured vs MAME: a font
+      // glyph left B2 = linear 000976c0 where MAME keeps XY 009700d8. (Linear-dest
+      // PIXBLT still writes the linear pblt_dst_addr_q; XY-source SADDR is analogous
+      // but not yet exercised here.)
+      INSTR_PIXBLT_LL: rf_wr_data =
+              pblt_wb_saddr    ? pblt_src_addr_q                        // SADDR -> B0
+            : decoded.blt_dst_xy
+                ? {pblt_dst_xy_raw_q[DATA_WIDTH-1:16] + pblt_dy_q,      // DADDR (XY) -> B2
+                   pblt_dst_xy_raw_q[15:0]}
+                : pblt_dst_addr_q;                                      // DADDR (linear) -> B2
+      INSTR_LINE:    rf_wr_data = line_wb_d     ? line_d_q      // d -> B0
+                               : line_wb_daddr  ? line_daddr_q  // DADDR -> B2
+                                                : line_count_q; // COUNT -> B10
+      INSTR_GETPC,
+      INSTR_EXGPC:  rf_wr_data = pc_value;
+      INSTR_REV:    rf_wr_data = REV_VALUE;
+      INSTR_LMO_RR: rf_wr_data = lmo_result;
+      INSTR_SEXT:   rf_wr_data = sext_result;
+      INSTR_ZEXT:   rf_wr_data = zext_result;
+      INSTR_EXGF:   rf_wr_data = exgf_new_rd;
+      default:      rf_wr_data = decoded.use_shifter ? shifter_result : alu_result;
+    endcase
+  end
+
+  // ALU operand selection.
+  //
+  // Default routing puts Rs on `alu_a` and Rd on `alu_b`, which works for
+  // commutative reg-reg ops (ADD, AND, OR, XOR, ...) and for the move
+  // family (`alu_b` is overridden to the immediate / K).
+  //
+  // For SUB (Rd - Rs → Rd) the order matters: we need `alu_a = Rd` and
+  // `alu_b = Rs` because the ALU computes `a - b`. The two muxes below
+  // swap routing for `INSTR_SUB_RR`.
+  assign alu_op  = decoded.alu_op;
+  always_comb begin
+    unique case (decoded.iclass)
+      INSTR_SUB_RR,
+      INSTR_SUBB_RR,
+      INSTR_ANDN_RR,
+      INSTR_CMP_RR,
+      INSTR_ADDK,
+      INSTR_SUBK,
+      INSTR_NEG,
+      INSTR_NOT,
+      INSTR_ABS,
+      INSTR_ADDI_IW,
+      INSTR_SUBI_IW,
+      INSTR_CMPI_IW,
+      INSTR_ADDI_IL,
+      INSTR_SUBI_IL,
+      INSTR_CMPI_IL,
+      INSTR_ANDI_IL,
+      INSTR_ORI_IL,
+      INSTR_XORI_IL,
+      INSTR_DSJ,
+      INSTR_DSJEQ,
+      INSTR_DSJNE,
+      INSTR_DSJS,
+      INSTR_BTST_K,
+      INSTR_BTST_RR: alu_a = rf_rs2_data;   // Rd is the operand
+      INSTR_NEGB:    alu_a = '0;            // NEGB: 0 - Rd - C via SUBB
+      INSTR_PUSHST,
+      INSTR_POPST,
+      INSTR_CALL_RS,
+      INSTR_CALLA,
+      INSTR_CALLR,
+      INSTR_RETS,
+      INSTR_RETI,
+      INSTR_TRAP:    alu_a = rf_rs2_data;   // SP via rs2 (rd_idx=15)
+      default:       alu_a = rf_rs1_data;   // Rs (or unused for MOVI/MOVK)
+    endcase
+  end
+  always_comb begin
+    unique case (decoded.iclass)
+      // P0008: TMS34010 stores the ONE'S COMPLEMENT of the immediate for the
+      // subtracting-immediate forms SUBI and CMPI (both IW and IL): "CMPI 505h"
+      // encodes 0xFAFA, "SUBI 4h" encodes 0xFFFB, "CMPI 10EB4E0h" encodes
+      // 0xFEF14B1F. The ALU computes a - b, so feed ~imm32 to subtract/compare
+      // against the true value. ADDI/ORI/XORI/MOVI store the immediate as-is;
+      // ANDI's complement is handled separately by ALU_OP_ANDN (P0003). Verified
+      // against MAME/unidasm across the whole ROM; the custom-chip self-test's
+      // `CMPI 505h` was yielding Z=0 for A3=0x505 (blit readback). See PATCHES.md.
+      INSTR_SUBI_IW,
+      INSTR_CMPI_IW,
+      INSTR_SUBI_IL,
+      INSTR_CMPI_IL: alu_b = ~imm32;
+      INSTR_MOVI_IW,
+      INSTR_MOVI_IL,
+      INSTR_ADDI_IW,
+      INSTR_ADDI_IL,
+      INSTR_ANDI_IL,
+      INSTR_ORI_IL,
+      INSTR_XORI_IL: alu_b = imm32;
+      // P0007: MOVK/ADDK/SUBK take a constant in 1..32 with a field value of 0
+      // encoding 32 (TMS34010 UG). The core used k5 directly, so "SUBK 20h" (32,
+      // field 0) subtracted 0 -> garbled text/sprite glyph lookups. Map 0 -> 32.
+      INSTR_MOVK,
+      INSTR_ADDK,
+      INSTR_SUBK:    alu_b = (decoded.k5 == 5'd0) ? 32'd32
+                                                  : {{(DATA_WIDTH-5){1'b0}}, decoded.k5};
+      INSTR_DSJ,
+      INSTR_DSJEQ,
+      INSTR_DSJNE,
+      INSTR_DSJS:    alu_b = {{(DATA_WIDTH-5){1'b0}}, decoded.k5};
+      INSTR_BTST_K:  alu_b = 32'd1 << decoded.k5;
+      INSTR_BTST_RR: alu_b = 32'd1 << rf_rs1_data[4:0];
+      INSTR_PUSHST,
+      INSTR_POPST,
+      INSTR_CALL_RS,
+      INSTR_CALLA,
+      INSTR_CALLR:   alu_b = WORD_BIT_SIZE;
+      INSTR_RETS:    alu_b = WORD_BIT_SIZE + ({{(DATA_WIDTH-5){1'b0}}, decoded.k5} << 4);
+      INSTR_RETI:    alu_b = WORD_BIT_SIZE_2;     // SP += 32 (ST pop) + 32 (PC pop) = 64
+      INSTR_TRAP:    alu_b = trap_skip_push ? 32'd0 : WORD_BIT_SIZE_2;
+                                          // N>0: SP -= 64 (PC push + ST push).
+                                          // N=0: SP unchanged (TRAP 0 skips pushes).
+      INSTR_SUB_RR,
+      INSTR_SUBB_RR,
+      INSTR_ANDN_RR,
+      INSTR_CMP_RR:  alu_b = rf_rs1_data;   // Rs is the "second" operand
+      default:       alu_b = rf_rs2_data;
+    endcase
+  end
+  assign alu_cin = st_c;
+
+  // Status-register inputs. Flag-update is gated by FSM state, like the
+  // regfile write. Full ST write port is unused until POPST lands.
+  assign st_flag_update_en = ((state_q == CORE_WRITEBACK) && decoded.wb_flags_en)
+                           || fill_win_flag_wb;   // FILL W=2 writes V
+  // ST-write data + enable. Two instructions drive the full ST-write
+  // path:
+  //   PUTST Rs: ST ← Rs (full copy).
+  //   SETF FS, FE, F: read current ST, splice the F-selected FS/FE
+  //                   pair with the new values from the instruction
+  //                   word, write back.
+  //
+  // SETF operand extraction (from instr_word_q):
+  //   F  = instr_word_q[9]
+  //   FE = instr_word_q[5]
+  //   FS = instr_word_q[4:0]
+  logic [DATA_WIDTH-1:0] setf_new_st;
+  always_comb begin
+    setf_new_st = st_value;  // start from current
+    if (instr_word_q[9]) begin
+      // F=1: update FS1 (bits[10:6]) and FE1 (bit[11]).
+      setf_new_st[ST_FS1_HI:ST_FS1_LO] = instr_word_q[4:0];
+      setf_new_st[ST_FE1_BIT]          = instr_word_q[5];
+    end else begin
+      // F=0: update FS0 (bits[4:0]) and FE0 (bit[5]).
+      setf_new_st[ST_FS0_HI:ST_FS0_LO] = instr_word_q[4:0];
+      setf_new_st[ST_FE0_BIT]          = instr_word_q[5];
+    end
+  end
+
+  assign st_write_en = ((state_q == CORE_WRITEBACK)
+                    && ((decoded.iclass == INSTR_PUTST) ||
+                        (decoded.iclass == INSTR_SETF)  ||
+                        (decoded.iclass == INSTR_EXGF)  ||
+                        (decoded.iclass == INSTR_DINT)  ||
+                        (decoded.iclass == INSTR_EINT)  ||
+                        (decoded.iclass == INSTR_POPST) ||
+                        (decoded.iclass == INSTR_RETI)  ||
+                        (decoded.iclass == INSTR_TRAP)))
+                    || ((state_q == CORE_INT_DONE) && int_push_q);
+  always_comb begin
+    if (state_q == CORE_INT_DONE) begin
+      // Interrupt entry: the GSP replaces ST with its reset value 0x00000010
+      // (IE=0, flags=0, FE0=0/FS0=16, FE1=0/FS1=0=32) AFTER pushing the full
+      // pre-interrupt ST (pushed in CORE_INT_PUSH_ST) — identical to TRAP.
+      // Spec: 1988 UG §8.4 "Interrupt Processing" (page 8-5) step 3 + the
+      // step-5 narrative: "All interrupts are disabled; Field 0 is 16 bits
+      // long and is zero extended; Field 1 is 32 bits long and is zero
+      // extended." MAME check_interrupt() -> RESET_ST() (tms34010.cpp:702/645
+      // -> :226-229 SET_ST(0x00000010)). This SUPERSEDES A0030, which cleared
+      // only ST.IE and left FE0/FS/flags intact; that preserved-FE0 was a
+      // real MAME/spec divergence the MAME<->RTL differential debugger caught
+      // on every X1 (DMA-done) interrupt entry through the UMK3 char-select
+      // draw (19 identical ST bit-5 mismatches).
+      st_write_data = ST_RESET_VALUE;
+    end else
+    unique case (decoded.iclass)
+      INSTR_PUTST: st_write_data = rf_rs1_data;
+      INSTR_SETF:  st_write_data = setf_new_st;
+      INSTR_EXGF:  st_write_data = exgf_new_st;
+      INSTR_DINT:  st_write_data = st_value & ~(32'd1 << ST_IE_BIT);
+      INSTR_EINT:  st_write_data = st_value |  (32'd1 << ST_IE_BIT);
+      INSTR_POPST: st_write_data = popped_st_q;
+      INSTR_RETI:  st_write_data = popped_st_q;      // ST captured in step 0
+      INSTR_TRAP:  st_write_data = ST_RESET_VALUE;   // 0x10: IE=0, flags=0, FS0=16, FS1=0 (= reset ST).
+      default:     st_write_data = '0;
+    endcase
+  end
+
+  // ---- Branch-condition evaluator -----------------------------------------
+  // Combinational decode of decoded.branch_cc against the current ST
+  // flags. Returns 1 if the branch should be taken. Codes not in the
+  // verified set (A0017) return 0 (no branch); the decoder is responsible
+  // for routing unverified codes to ILLEGAL so this default isn't reached
+  // by a recognized JRCC.
+  logic branch_taken;
+  always_comb begin
+    unique case (decoded.branch_cc)
+      CC_UC:   branch_taken = 1'b1;
+      CC_P:    branch_taken = !st_n & !st_z;           // P0004: P = positive (>0), ~N & ~Z
+      CC_LS:   branch_taken = st_c | st_z;             // unsigned <=
+      CC_HI:   branch_taken = !st_c & !st_z;           // unsigned >
+      CC_LT:   branch_taken = st_n ^ st_v;             // signed   <
+      CC_LE:   branch_taken = (st_n ^ st_v) | st_z;    // signed   <=
+      CC_GT:   branch_taken = !(st_n ^ st_v) & !st_z;  // signed   >
+      CC_GE:   branch_taken = !(st_n ^ st_v);          // signed   >=
+      CC_EQ:   branch_taken = st_z;                    // =
+      CC_NE:   branch_taken = !st_z;                   // !=
+      CC_HS:   branch_taken = !st_c;                   // unsigned >=  (== NC)
+      CC_C:    branch_taken = st_c;                     // carry set (== B)
+      CC_V:    branch_taken = st_v;                     // overflow
+      CC_NV:   branch_taken = !st_v;                    // no overflow
+      CC_N:    branch_taken = st_n;                     // negative
+      CC_NN:   branch_taken = !st_n;                    // nonnegative
+      default: branch_taken = 1'b0;
+    endcase
+  end
+
+  // ---- PC-load (branches) -------------------------------------------------
+  // Gated by FSM state. For JRcc short, load the relative target in
+  // CORE_WRITEBACK only when the condition is met.
+  always_comb begin
+    pc_load_en    = 1'b0;
+    pc_load_value = '0;
+    if (state_q == CORE_WRITEBACK) begin
+      unique case (decoded.iclass)
+        INSTR_JRCC_SHORT: begin
+          if (branch_taken) begin
+            pc_load_en    = 1'b1;
+            pc_load_value = branch_target_short;
+          end
+        end
+        INSTR_JRCC_LONG: begin
+          if (branch_taken) begin
+            pc_load_en    = 1'b1;
+            pc_load_value = branch_target_long;
+          end
+        end
+        INSTR_JUMP_RS: begin
+          // Unconditional indirect jump: load PC from Rs (read via rs1
+          // port) with the bottom 4 bits forced to 0 to enforce
+          // word alignment per SPVU001A page 12-98.
+          pc_load_en    = 1'b1;
+          pc_load_value = {rf_rs1_data[ADDR_WIDTH-1:4], 4'h0};
+        end
+        INSTR_EXGPC: begin
+          // Atomic swap PC ↔ Rd: PC ← old Rd (with bottom 4 bits forced
+          // to 0 per A0025), Rd ← PC (via the rf_wr_data mux above).
+          // rf_rs2_data is the async-read value of decoded.rd_idx in
+          // the same file as the destination — i.e., the OLD Rd value.
+          pc_load_en    = 1'b1;
+          pc_load_value = {rf_rs2_data[ADDR_WIDTH-1:4], 4'h0};
+        end
+        INSTR_DSJ,
+        INSTR_DSJEQ,
+        INSTR_DSJNE: begin
+          // Decrement-and-skip-jump family. Branch taken iff the
+          // runtime pre-condition (always for DSJ; Z gate for
+          // DSJEQ/DSJNE) holds AND the post-decrement Rd is nonzero.
+          // Target shape matches the long-form JRcc:
+          //   target = PC' + sign_extend(offset16) * 16
+          // where PC' is pc_value at WRITEBACK (already advanced
+          // through the opcode + offset-word fetches).
+          if (dsj_precondition && dsj_rd_nonzero) begin
+            pc_load_en    = 1'b1;
+            pc_load_value = branch_target_long;
+          end
+        end
+        INSTR_JACC: begin
+          // Absolute conditional jump: PC ← {imm_hi_q, imm_lo_q} with
+          // the bottom 4 bits forced to 0 (word alignment per spec
+          // page 12-91). Re-uses the JRcc condition evaluator.
+          if (branch_taken) begin
+            pc_load_en    = 1'b1;
+            pc_load_value = branch_target_jacc;
+          end
+        end
+        INSTR_DSJS: begin
+          // Short-form decrement-and-skip-jump. Branch taken iff the
+          // post-decrement Rd is non-zero (dsj_precondition = 1 for
+          // DSJS just like DSJ). Target = PC' ± offset×16 per
+          // instr_word_q[10] direction bit.
+          if (dsj_rd_nonzero) begin
+            pc_load_en    = 1'b1;
+            pc_load_value = branch_target_dsjs;
+          end
+        end
+        INSTR_CALL_RS: begin
+          // Subroutine call indirect: PC <- Rs (with bottom 4 bits
+          // forced to 0 per SPVU001A page 12-47 "always sets the four
+          // LSBs of the program counter to 0"). The return address
+          // PC' has already been pushed to mem[new SP] in
+          // CORE_MEMORY by the time we reach this WRITEBACK arm.
+          pc_load_en    = 1'b1;
+          pc_load_value = {rf_rs1_data[ADDR_WIDTH-1:4], 4'h0};
+        end
+        INSTR_CALLA: begin
+          // Absolute call: PC <- {imm_hi_q, imm_lo_q} with bottom 4
+          // bits cleared. Same target as JAcc (branch_target_jacc).
+          pc_load_en    = 1'b1;
+          pc_load_value = branch_target_jacc;
+        end
+        INSTR_CALLR: begin
+          // Relative call: PC <- PC' + sign_ext(disp16) * 16. Same
+          // target as JRcc long-form (branch_target_long).
+          pc_load_en    = 1'b1;
+          pc_load_value = branch_target_long;
+        end
+        INSTR_RETS: begin
+          // Return from subroutine: PC <- popped value (= mem_rdata_eff,
+          // which the memory model still holds after the ack since it
+          // doesn't clear on IDLE). The popped value is already
+          // word-aligned (since it was pushed by a CALL/CALLA/CALLR
+          // or TRAP), so no bottom-nibble mask is needed.
+          pc_load_en    = 1'b1;
+          pc_load_value = popped_pc_q;
+        end
+        INSTR_RETI: begin
+          // Return from interrupt: PC <- popped_pc_q (latched in
+          // step 1 of CORE_MEMORY). The matching popped ST is delivered
+          // via the st_write_en path above.
+          pc_load_en    = 1'b1;
+          pc_load_value = popped_pc_q;
+        end
+        INSTR_TRAP: begin
+          // Software interrupt: PC <- trap-vector value (latched into
+          // popped_pc_q on step 2 of CORE_MEMORY). New ST is delivered
+          // via the st_write_en path; SP -64 lands via alu_result/regfile.
+          pc_load_en    = 1'b1;
+          pc_load_value = popped_pc_q;
+        end
+        default: ; // no branch
+      endcase
+    end else if (state_q == CORE_INT_DONE) begin
+      // Interrupt entry: load PC with the trap vector (ISR entry address),
+      // latched into popped_pc_q on the CORE_INT_VECTOR ack. Already word-
+      // aligned (it is a vector word), so no bottom-nibble mask.
+      pc_load_en    = 1'b1;
+      pc_load_value = popped_pc_q;
+    end else if (state_q == CORE_RESET_VEC && mem_ack) begin
+      // P0001 (Arcade-SmashTV): load the reset PC directly from the vector
+      // word as it is acked (mem_size = 32, so mem_rdata_eff is the full PC).
+      pc_load_en    = 1'b1;
+      pc_load_value = mem_rdata_eff;
+    end
+  end
+
+  tms34010_regfile #(.USE_MLAB(MLAB_REGFILE)) u_regfile (
+    .clk      (clk),
+    .ce_cpu   (ce_cpu),
+    .rst      (rst),
+    .rs1_file (rf_rs1_file),
+    .rs1_idx  (rf_rs1_idx),
+    .rs1_data (rf_rs1_data),
+    .rs2_file (rf_rs2_file),
+    .rs2_idx  (rf_rs2_idx),
+    .rs2_data (rf_rs2_data),
+    .rs3_file (rf_rs3_file),
+    .rs3_idx  (rf_rs3_idx),
+    .rs3_data (rf_rs3_data),
+    .wr_en    (rf_wr_en),
+    .wr_file  (rf_wr_file),
+    .wr_idx   (rf_wr_idx),
+    .wr_data  (rf_wr_data),
+    .sp_o     (rf_sp)
+  );
+
+  // ---- On-chip I/O register file (Task 0082) ------------------------------
+  // Accesses whose bit-address is in I/O space (0xC0000000-0xC00001FF) are
+  // serviced on-chip. The register file's async read is muxed into
+  // `mem_rdata_eff`, so MOVE/MOVB loads from I/O space observe the register
+  // value; writes commit into the register file from the same req/we/addr
+  // the external bus sees. The external memory ignores the I/O address range
+  // (it is out of range for the simulation memory model), so the external
+  // cycle is harmless. Faithful external-cycle gating (RAS-only) and an
+  // on-chip ack belong with a later memory-fabric module. I/O registers are
+  // 16-bit; the core accesses them with 16-bit fields (set FS=16).
+  logic                  io_is_io;
+  logic [15:0]           io_rdata16;
+  logic [15:0]           io_intenb;    // INTENB register (maskable-interrupt enables)
+  logic [15:0]           io_intpend;   // INTPEND register (maskable-interrupt pending)
+  logic [15:0]           io_dpyctl;    // DPYCTL register (SRT enable = bit 11)
+  logic [15:0]           io_hstctlh;   // HSTCTLH register (host control; NMI/NMIM bits)
+  logic                  nmi_clear;    // pulse to clear HSTCTLH.NMI on taking the NMI
+  logic                  mem_we_int;   // the FSM's write intent (pre-I/O gating)
+  tms34010_io_regs #(.LOCAL_WRITE(LOCAL_IO_WRITE), .CPU_CE_WRITE(IO_CPU_CE)) u_io_regs (
+    .ce_cpu   (ce_cpu),
+    .clk      (clk),
+    .rst      (rst),
+    .ce_pix   (ce_pix),        // P00xx: dot-clock enable -> live video counters + per-frame DPYINT
+    .req      (mem_req),
+    .we       (mem_we_int),    // the access's write intent
+    .addr     (mem_addr),
+    .size     (mem_size),
+    .wdata    (mem_wdata),          // full field; io_regs spans FS>16 into idx+1
+    .rdata    (io_rdata16),
+    .is_io    (io_is_io),
+    .psize_o  (io_psize),
+    .convdp_o (io_convdp),
+    .convsp_o (io_convsp),
+    .control_o(io_control),
+    .pmask_o  (io_pmask),
+    .dpyctl_o (io_dpyctl),   // SRT gating tap (see srt_on below)
+    .intenb_o (io_intenb),
+    .intpend_o(io_intpend),
+    .dpystrt_o(dpystrt_o),   // P0024: straight out (no core-internal use)
+    .dpyadr_o(dpyadr_o),
+    .vblank_start_o(vblank_start_o),
+    .hstctlh_o(io_hstctlh),
+    .nmi_clear(nmi_clear),
+    .wvp_set  (wvp_set),
+    .lint1_in (lint1_in),     // P0016: external LINT1 pin -> INTPEND.X1P mirror
+    // Phase 2B: dynamic display geometry
+    .heblnk_o (heblnk_o),
+    .hsblnk_o (hsblnk_o),
+    .veblnk_o (veblnk_o),
+    .vsblnk_o (vsblnk_o)
+  );
+
+  // ---- Maskable-interrupt priority encoder (Task 0100) --------------------
+  // Combinational: int_req asserts when ST.IE=1 and an enabled INTPEND bit is
+  // set; int_vector is the winning source's trap-vector address. The core
+  // recognises the request at the CORE_FETCH boundary and runs the entry
+  // sequence below. NMI (host, via HSTCTL) is separate and not handled here.
+  logic                  int_req;
+  logic [ADDR_WIDTH-1:0] int_vector;
+  tms34010_int_ctrl u_int_ctrl (
+    .intpend   (io_intpend),
+    .intenb    (io_intenb),
+    .ie        (st_value[ST_IE_BIT]),
+    .int_req   (int_req),
+    .int_vector(int_vector)
+  );
+  // Nonmaskable interrupt (NMI): host sets HSTCTLH.NMI. It is non-maskable
+  // (ignores ST.IE) and takes priority over maskable interrupts. NMIM selects
+  // whether context (PC/ST) is pushed. The device auto-clears the NMI bit on
+  // taking it (nmi_clear pulse below), else — being non-maskable — it would
+  // re-trigger forever.
+  logic nmi_req, nmi_nmim;
+  assign nmi_req  = io_hstctlh[HSTCTL_NMI_BIT];
+  assign nmi_nmim = io_hstctlh[HSTCTL_NMIM_BIT];
+  // Any interrupt is taken at the fetch boundary when NMI is pending or a
+  // maskable request is asserted.
+  logic int_take;
+  assign int_take = nmi_req || int_req;
+
+  // P0013: a fetch request the memory system has already latched MUST run to
+  // completion before we honour an interrupt. Otherwise, if int_take rises after
+  // mem_req was asserted (e.g. the display interrupt firing mid-fetch — possible
+  // once P0012 made INTPEND.DI async to the CPU), the core would abort the fetch
+  // and jump to CORE_INT_PUSH_PC; the memsys's ack for the aborted fetch then
+  // gets misattributed to the interrupt's PC push, so that 32-bit write is
+  // silently dropped and RETI returns to a corrupt (0) address → derail. Once a
+  // fetch is in flight, ignore int_take until mem_ack; the interrupt is taken at
+  // the next fetch boundary — HW-correct (the in-flight instruction completes).
+  logic fetch_inflight_q;
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst)
+      fetch_inflight_q <= 1'b0;
+    else if (state_q == CORE_FETCH && mem_req && !mem_ack)
+      fetch_inflight_q <= 1'b1;
+    else if (mem_ack || state_q != CORE_FETCH)
+      fetch_inflight_q <= 1'b0;
+  end
+
+  // Latched state for the entry sequence (captured when leaving CORE_FETCH):
+  //   int_vec_q    — the trap-vector address to fetch.
+  //   int_is_nmi_q — this entry is an NMI (drives the auto-clear).
+  //   int_push_q   — context is pushed (always for maskable; NMIM=0 for NMI).
+  // nmi_clear pulses in CORE_INT_DONE when the latched entry was an NMI.
+  logic [ADDR_WIDTH-1:0] int_vec_q;
+  logic                  int_is_nmi_q;
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      int_vec_q    <= '0;
+      int_is_nmi_q <= 1'b0;
+      int_push_q   <= 1'b0;
+    end else if (state_q == CORE_FETCH && int_take) begin
+      int_vec_q    <= nmi_req ? INT_VEC_NMI : int_vector;
+      int_is_nmi_q <= nmi_req;
+      int_push_q   <= nmi_req ? !nmi_nmim : 1'b1;   // NMIM=1 ⇒ no push
+    end
+  end
+  assign nmi_clear = (state_q == CORE_INT_DONE) && int_is_nmi_q;
+  // Gate the EXTERNAL write for I/O-space accesses: an I/O write commits into
+  // u_io_regs and must NOT also write external memory (otherwise it would
+  // corrupt RAM — a small external model that only decodes low address bits
+  // would alias 0xC00001xx onto a low word). The external cycle is still
+  // requested (so external memory provides the ack, RAS-style), but with
+  // write disabled for I/O addresses; the read data is muxed below.
+  assign mem_we = mem_we_int && !io_is_io;
+  assign mem_req = mem_read_active
+                 && !(state_q == CORE_FETCH && int_take && !fetch_inflight_q);
+
+  // SRT enable: DPYCTL bit 11 (1988 UG p114). An I/O write to DPYCTL commits
+  // in its own CORE_MEMORY cycle, so the tap is stable before any SUBSEQUENT
+  // pixel access — matching MAME, which re-runs set_pixel_function on the
+  // register write (tms34010.cpp:937-967); no same-instruction hazard exists
+  // in the game sequence (MAIN.ASM:636 writes DPYCTL, :638 is the PIXT).
+  logic srt_on;
+  assign srt_on = io_dpyctl[DPYCTL_SRT_BIT];
+
+  // Effective read data. The external memory model holds mem_rdata stable
+  // from the ack cycle through WRITEBACK, but the I/O register's async read
+  // follows mem_addr and would change once the address moves on. So latch
+  // the I/O read at the access ack and hold it: during an active transaction
+  // (mem_req high, i.e. the ack cycle) use the combinational decode; once the
+  // transaction has retired (WRITEBACK, mem_req low) use the latched I/O
+  // value if the just-completed access was I/O, else the persisted external
+  // mem_rdata.
+  logic [15:0] io_rdata_q;
+  logic        io_is_io_q;
+  always_ff @(posedge clk) if (rst || (ce_cpu !== 1'b0)) begin
+    if (rst) begin
+      io_rdata_q <= '0;
+      io_is_io_q <= 1'b0;
+    end else if (mem_req && mem_ack) begin
+      io_rdata_q <= io_rdata16;
+      io_is_io_q <= io_is_io;
+    end
+  end
+  assign mem_rdata_eff =
+      mem_read_active ? (io_is_io   ? {{(DATA_WIDTH-16){1'b0}}, io_rdata16} : mem_rdata)
+              : (io_is_io_q ? {{(DATA_WIDTH-16){1'b0}}, io_rdata_q} : mem_rdata);
+
+  tms34010_alu u_alu (
+    .op    (alu_op),
+    .a     (alu_a),
+    .b     (alu_b),
+    .cin   (alu_cin),
+    .result(alu_result),
+    .flags (alu_flags)
+  );
+
+  // Shifter datapath. Operand is the Rd register value (via rf_rs2_data,
+  // which already reads decoded.rd_idx in the same file as the
+  // destination). Shift amount comes from one of two sources:
+  //   - K-form shifts (SLA/SLL/SRA/SRL/RL K, Rd):  decoded.k5 (literal K)
+  //   - Rs-form left/rotate shifts (SLA/SLL/RL Rs, Rd):  Rs[4:0] directly
+  //   - Rs-form right shifts (SRA/SRL Rs, Rd):  2's complement of Rs[4:0]
+  //     (per spec page 12-219; "use the 2s complement value of the
+  //     5 LSBs in Rs"). The negation is done here in the amount mux.
+  logic [SHIFT_AMOUNT_WIDTH-1:0] shifter_amount;
+  always_comb begin
+    unique case (decoded.iclass)
+      INSTR_SLA_RR,
+      INSTR_SLL_RR,
+      INSTR_RL_RR:  shifter_amount = rf_rs1_data[SHIFT_AMOUNT_WIDTH-1:0];
+      INSTR_SRA_RR,
+      INSTR_SRL_RR: shifter_amount = (~rf_rs1_data[SHIFT_AMOUNT_WIDTH-1:0])
+                                     + {{(SHIFT_AMOUNT_WIDTH-1){1'b0}}, 1'b1};
+      // P0005: the SRL/SRA K-form encodes its count as (32 - amount) — the raw
+      // 5-bit field is the 2's complement of the shift amount (e.g. "SRL 1Ch"
+      // = shift-right-28 = field 0x04). The SLL/SLA/RL K-forms store the amount
+      // directly. So right-shift-by-constant must 2's-complement k5, mirroring
+      // the Rs-form above. (Was: default -> k5, which shifted right by 32-K.)
+      INSTR_SRA_K,
+      INSTR_SRL_K:  shifter_amount = (~decoded.k5) + {{(SHIFT_AMOUNT_WIDTH-1){1'b0}}, 1'b1};
+      default:      shifter_amount = decoded.k5;
+    endcase
+  end
+
+  tms34010_shifter u_shifter (
+    .op    (decoded.shift_op),
+    .a     (rf_rs2_data),
+    .amount(shifter_amount),
+    .result(shifter_result),
+    .flags (shifter_flags)
+  );
+
+  // Flag-input mux: status register samples either ALU flags or shifter
+  // flags depending on the source of the result.
+  // Flag-input mux: SET/CLR-C inject a constant C value (paired with
+  // the wb_flag_mask = c-only in their decoder arms); other
+  // flag-affecting instructions get their flags from the ALU or shifter
+  // per `decoded.use_shifter`.
+  alu_flags_t  flag_input;
+  always_comb begin
+    if (fill_win_flag_wb) begin
+      // FILL W=2 window result: only V is written (mask below is V-only).
+      flag_input = '{n: 1'b0, c: 1'b0, z: 1'b0, v: fill_win_violation};
+    end else
+    unique case (decoded.iclass)
+      INSTR_SETC:   flag_input = '{n: 1'b0, c: 1'b1, z: 1'b0, v: 1'b0};
+      INSTR_CLRC:   flag_input = '{n: 1'b0, c: 1'b0, z: 1'b0, v: 1'b0};
+      INSTR_LMO_RR: flag_input = '{n: 1'b0, c: 1'b0,
+                                    z: (rf_rs1_data == '0), v: 1'b0};
+      INSTR_SEXT:   flag_input = '{n: sext_result[DATA_WIDTH-1], c: 1'b0,
+                                    z: (sext_result == '0), v: 1'b0};
+      INSTR_ZEXT:   flag_input = '{n: 1'b0, c: 1'b0,
+                                    z: (zext_result == '0), v: 1'b0};
+      // MMTM (SPVU001A page 12-111): N = sign of (0 - original Rp) with
+      // exceptions Rp=0 -> 1 and Rp=0x80000000 -> 0; the closed form is
+      // N = ~Rp[31]. rf_rs2_data still reads the ORIGINAL Rp during
+      // WRITEBACK (the final-Rp write is in flight on the same edge, and
+      // the regfile read returns the pre-write value). C/Z/V are masked
+      // off (Unaffected) via wb_flag_mask, so only the N field matters.
+      INSTR_MMTM:   flag_input = '{n: ~rf_rs2_data[DATA_WIDTH-1],
+                                    c: 1'b0, z: 1'b0, v: 1'b0};
+      // MOVE load (indirect / offset / absolute): implicit compare-to-0 of
+      // the captured operand AFTER FE sign/zero extension at WRITEBACK.
+      // N = result sign, Z = result==0, V=0; C masked off by
+      // wb_flag_mask. For a PIXT load (force_pixel) the only defined status
+      // bit is V = (pixel != 0); the PIXT-load decode masks N/C/Z off (they
+      // are spec-Undefined).
+      INSTR_MOVE_FIELD_LOAD,
+      INSTR_MOVE_ABS_LOAD,
+      INSTR_MOVE_OFF_LOAD:  flag_input = '{n: mv_load_data[DATA_WIDTH-1],
+                                    c: 1'b0, z: (mv_load_data == '0),
+                                    v: (decoded.force_pixel && (mv_load_data != '0))};
+      INSTR_ADDXY:  flag_input = addxy_flags;
+      INSTR_SUBXY:  flag_input = subxy_flags;
+      INSTR_CMPXY:  flag_input = cmpxy_flags;
+      INSTR_CPW:    flag_input = cpw_flags;
+      // MPYS: N/Z from the 64-bit product. MPYU: Z only (N masked off).
+      INSTR_MPYS,
+      INSTR_MPYU:   flag_input = '{n: mpy_product_q[63], c: 1'b0,
+                                    z: (mpy_product_q == 64'd0), v: 1'b0};
+      // Divide family (DIVU/DIVS/MODU/MODS): V = overflow; Z = (result==0);
+      // N = result sign (signed variants only — masked off for unsigned by
+      // wb_flag_mask). The result is the quotient (DIV) or remainder (MOD),
+      // already sign-conditioned. On overflow N/Z read 0; for the MOD ops
+      // the Z mask is cleared on overflow (effective_flag_mask) so Z stays
+      // Unaffected when Rs=0.
+      INSTR_DIVU,
+      INSTR_DIVS,
+      INSTR_MODU,
+      INSTR_MODS:   flag_input = '{n: (is_signed_div && !div_v && div_result_main[DATA_WIDTH-1]),
+                                    c: 1'b0,
+                                    z: (!div_v && (div_result_main == '0)),
+                                    v: div_v};
+      default:      flag_input = decoded.use_shifter ? shifter_flags : alu_flags;
+    endcase
+  end
+
+  // Effective per-flag update mask. Normally the decoded mask, but MODU
+  // (and the future MODS) leave Z "Unaffected" when Rs=0 (overflow), which
+  // is a runtime condition the static decode mask can't express.
+  alu_flags_t effective_flag_mask;
+  always_comb begin
+    effective_flag_mask = decoded.wb_flag_mask;
+    if (is_div_mod && div_v) effective_flag_mask.z = 1'b0;  // MODU/MODS: Z unaffected on Rs=0
+    if (fill_win_flag_wb)
+      effective_flag_mask = '{n: 1'b0, c: 1'b0, z: 1'b0, v: 1'b1};  // FILL W=2: V only
+  end
+
+  tms34010_status_reg u_status_reg (
+    .clk             (clk),
+    .ce_cpu          (ce_cpu),
+    .rst             (rst),
+    .flag_update_en  (st_flag_update_en),
+    .flags_in        (flag_input),
+    .flag_update_mask(effective_flag_mask),
+    .st_write_en     (st_write_en),
+    .st_write_data   (st_write_data),
+    .st_o            (st_value),
+    .n_o             (st_n),
+    .c_o             (st_c),
+    .z_o             (st_z),
+    .v_o             (st_v)
+  );
+
+  // Currently-unused datapath observability — keep the lint sweep
+  // clean without falsely claiming we consume the value.
+  logic [DATA_WIDTH-1:0] unused_rf_sp;
+  logic [DATA_WIDTH-1:0] unused_st_value;
+  logic                  unused_st_nv;
+  assign unused_rf_sp    = rf_sp;
+  assign unused_st_value = st_value;
+  assign unused_st_nv    = st_n ^ st_v ^ st_z;  // touch all three to suppress
+
+
+  // ---------------------------------------------------------------------------
+  // Next-state + combinational outputs
+  //
+  // Safe defaults at the top — none of the output muxes can infer a latch.
+  // ---------------------------------------------------------------------------
+  always_comb begin
+    // Defaults.
+    state_d       = state_q;
+    mem_read_active = 1'b0;
+    mem_we_int        = 1'b0;
+    mem_addr      = '0;
+    mem_size      = '0;
+    mem_wdata     = '0;
+    mem_srt       = 1'b0;   // only graphics PIXEL accesses may convert (UG p114)
+    pc_advance_en = 1'b0;
+
+    unique case (state_q)
+      CORE_RESET: begin
+        // P0001 (Arcade-SmashTV): the TMS34010 loads its PC from the 32-bit
+        // reset vector at 0xFFFFFFE0 before executing. Go read it.
+        state_d = CORE_RESET_VEC;
+      end
+
+      CORE_RESET_VEC: begin
+        // P0001: fetch the reset PC from the level-0 (reset) trap vector.
+        // The PC-load comb loads pc from mem_rdata_eff on this ack.
+        mem_read_active = 1'b1;
+        mem_we_int = 1'b0;
+        mem_addr = TRAP_VECTOR_BASE;   // 0xFFFF_FFE0
+        mem_size = MEM_SIZE_32;
+        if (mem_ack) state_d = CORE_FETCH;
+      end
+
+      CORE_FETCH: begin
+        // Recognise a pending interrupt at the instruction boundary. NMI
+        // (non-maskable) takes priority over a maskable request (ST.IE=1 and an
+        // enabled INTPEND bit). When taken, do NOT fetch — pc_value stays at the
+        // resume address. An NMI with NMIM=1 saves no context and jumps
+        // straight to the vector; everything else pushes PC+ST first.
+        // P0013: gate on !fetch_inflight_q so an interrupt that arrives after the
+        // fetch request was already latched doesn't abort it (see fetch_inflight_q).
+        mem_read_active = 1'b1;
+        mem_addr = pc_value;
+        mem_size = INSTR_WORD_BITS;
+        if (int_take && !fetch_inflight_q) begin
+          state_d = (nmi_req && nmi_nmim) ? CORE_INT_VECTOR : CORE_INT_PUSH_PC;
+        end else begin
+          if (mem_ack) begin
+            state_d       = CORE_DECODE;
+            pc_advance_en = 1'b1;       // advance PC by INSTR_WORD_BITS
+          end
+        end
+      end
+
+      CORE_INT_PUSH_PC: begin
+        // Push the resume PC to mem[SP-32] (32-bit). SP is not updated until
+        // CORE_INT_DONE; the second push uses SP-64. Order matches RETI's pop
+        // (ST at the lower address, PC at the higher) and the TRAP push.
+        mem_read_active = 1'b1;
+        mem_we_int = 1'b1;
+        mem_addr  = rf_sp - WORD_BIT_SIZE;
+        mem_size  = MEM_SIZE_32;
+        mem_wdata = pc_value;
+        if (mem_ack) state_d = CORE_INT_PUSH_ST;
+      end
+
+      CORE_INT_PUSH_ST: begin
+        // Push ST to mem[SP-64] (32-bit).
+        mem_read_active = 1'b1;
+        mem_we_int = 1'b1;
+        mem_addr  = rf_sp - WORD_BIT_SIZE_2;
+        mem_size  = MEM_SIZE_32;
+        mem_wdata = st_value;
+        if (mem_ack) state_d = CORE_INT_VECTOR;
+      end
+
+      CORE_INT_VECTOR: begin
+        // Read the 32-bit trap vector (the ISR entry address) at the latched
+        // vector address; latch it into popped_pc_q for the PC load below.
+        mem_read_active = 1'b1;
+        mem_we_int = 1'b0;
+        mem_addr  = int_vec_q;
+        mem_size  = MEM_SIZE_32;
+        if (mem_ack) state_d = CORE_INT_DONE;
+      end
+
+      CORE_INT_DONE: begin
+        // One cycle to retire the entry: SP <- SP-64 (regfile), PC <- vector,
+        // ST.IE <- 0 (mask nested interrupts until RETI). Then fetch the ISR.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_DECODE: begin
+        // Branch based on how many immediate words the decoded
+        // instruction needs.
+        if (decoded.needs_imm32) begin
+          state_d = CORE_FETCH_IMM_LO;
+        end else if (decoded.needs_imm16) begin
+          state_d = CORE_FETCH_IMM_LO;
+        end else begin
+          state_d = CORE_EXECUTE;
+        end
+      end
+
+      CORE_FETCH_IMM_LO: begin
+        // Fetch the 16-bit low-immediate word from PC. Same protocol as
+        // CORE_FETCH; PC advances by INSTR_WORD_BITS on ack.
+        mem_read_active = 1'b1;
+        mem_we_int   = 1'b0;
+        mem_addr = pc_value;
+        mem_size = INSTR_WORD_BITS;
+        if (mem_ack) begin
+          pc_advance_en = 1'b1;
+          // P0015: MOVE *Rs(SOff),*Rd(DOff) fetches a SECOND 16-bit word
+          // (DOff) after SOff — route via CORE_FETCH_IMM2_LO.
+          state_d = decoded.needs_imm32 ? CORE_FETCH_IMM_HI
+                  : is_mv_off_m2m       ? CORE_FETCH_IMM2_LO
+                                        : CORE_EXECUTE;
+        end
+      end
+
+      CORE_FETCH_IMM_HI: begin
+        mem_read_active = 1'b1;
+        mem_we_int   = 1'b0;
+        mem_addr = pc_value;
+        mem_size = INSTR_WORD_BITS;
+        if (mem_ack) begin
+          pc_advance_en = 1'b1;
+          // P0014: MOVE @,@ needs a second absolute address (DAddr) after SAddr.
+          state_d = is_mv_abs_m2m ? CORE_FETCH_IMM2_LO : CORE_EXECUTE;
+        end
+      end
+
+      // P0014: fetch the DAddr (second 32-bit immediate) of MOVE @SAddr,@DAddr.
+      // P0015: also fetches the 16-bit DOff of MOVE *Rs(SOff),*Rd(DOff) — that
+      // form needs no HI word, so it exits straight to EXECUTE.
+      CORE_FETCH_IMM2_LO: begin
+        mem_read_active = 1'b1;
+        mem_we_int   = 1'b0;
+        mem_addr = pc_value;
+        mem_size = INSTR_WORD_BITS;
+        if (mem_ack) begin
+          pc_advance_en = 1'b1;
+          state_d = is_mv_off_m2m ? CORE_EXECUTE : CORE_FETCH_IMM2_HI;
+        end
+      end
+
+      CORE_FETCH_IMM2_HI: begin
+        mem_read_active = 1'b1;
+        mem_we_int   = 1'b0;
+        mem_addr = pc_value;
+        mem_size = INSTR_WORD_BITS;
+        if (mem_ack) begin
+          pc_advance_en = 1'b1;
+          state_d = CORE_EXECUTE;
+        end
+      end
+
+      CORE_EXECUTE: begin
+        // ALU output and flags are combinational from decoded.alu_op,
+        // alu_a, alu_b, and st_c. CORE_EXECUTE lets that result settle
+        // for one cycle. For instructions that need a memory
+        // transaction (PUSHST and the rest of the stack/CALL family),
+        // route through CORE_MEMORY first; otherwise go straight to
+        // CORE_WRITEBACK.
+        // Divide instructions hand off to the multi-cycle divider; others
+        // go to memory (if any) then writeback.
+        if (is_div)
+          state_d = CORE_DIVIDE;
+        else if (is_fill)
+          state_d = CORE_FILL_SETUP;   // FILL: latched DADDR/DPTCH/DYDX here
+        else if (is_pblt)
+          state_d = CORE_PBLT_SETUP;   // PIXBLT: latched SADDR/DADDR/DYDX here
+        else if (is_drav)
+          // DRAV: latched Rd/Rs/linear here. A windowed DRAV (W!=0) first reads
+          // WSTART/WEND to test Rd's pixel; W=0 goes straight to the draw.
+          state_d = (io_control[CTRL_W_HI:CTRL_W_LO] != 2'd0) ? CORE_DRAV_SETUP_WIN
+                                                              : CORE_DRAV;
+        else if (is_line)
+          state_d = CORE_LINE_SETUP1;  // LINE: read the implied B operands
+        else if (pixt_xy_win)
+          state_d = CORE_PIXT_SETUP_WIN; // windowed XY PIXT: read WSTART/WEND
+        else
+          state_d = decoded.needs_memory_op ? CORE_MEMORY : CORE_WRITEBACK;
+      end
+
+      CORE_DIVIDE: begin
+        // Hold while the divider runs; proceed to writeback when it signals
+        // done (results, incl. the overflow flag, are then stable).
+        state_d = div_done ? CORE_WRITEBACK : CORE_DIVIDE;
+      end
+
+      CORE_FILL_SETUP: begin
+        // One cycle to latch COLOR1 (and the counters were seeded at EXECUTE).
+        // FILL XY with a window (W=2 or W=3) takes one more cycle to read
+        // WSTART/WEND.
+        state_d = (fill_win_en_q || fill_w2_q || fill_w1_q) ? CORE_FILL_SETUP_WIN
+                                                            : CORE_FILL;
+      end
+
+      CORE_FILL_SETUP_WIN: begin
+        // Latch WSTART(B5)/WEND(B6). W=3 proceeds to the (per-pixel-clipped)
+        // fill. W=2 (miss detection) checks array containment now: draw only if
+        // the whole array is inside, else skip to CORE_FILL_WIN_MISS (no draw).
+        // W=1 (hit detection) never draws — go straight to CORE_FILL_WIN_HIT.
+        state_d = fill_w1_q                          ? CORE_FILL_WIN_HIT
+                : (fill_w2_q && !fill_array_inside)  ? CORE_FILL_WIN_MISS
+                                                     : CORE_FILL;
+      end
+
+      CORE_FILL_WIN_MISS: begin
+        // W=2 window miss: no pixels drawn; V=1 and WVP set (combinationally),
+        // then fetch the next instruction.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_FILL_WIN_HIT: begin
+        // W=1 hit detection: no pixels drawn. V and WVP are driven
+        // combinationally from fill_array_hit (overlap), then fetch.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_DRAV_SETUP_WIN: begin
+        // One cycle to read WSTART(B5)/WEND(B6) and test Rd's pixel. If the
+        // pixel is drawn (W=2/3 inside) go to the RMW; otherwise skip straight
+        // to CORE_WRITEBACK, which still advances Rd and writes V/WVP.
+        state_d = (((drav_w_q == 2'd2) || (drav_w_q == 2'd3)) && drav_in_window)
+                ? CORE_DRAV : CORE_WRITEBACK;
+      end
+
+      CORE_PIXT_SETUP_WIN: begin
+        // One cycle to read WSTART(B5)/WEND(B6); then the normal PIXT-store RMW
+        // runs in CORE_MEMORY (the window inhibits the write per pixel).
+        state_d = CORE_MEMORY;
+      end
+
+      CORE_DRAV: begin
+        // Single-pixel RMW at Rd's linear address: read the destination pixel
+        // (sub-step 0), then write the merged COLOR1 (sub-step 1). On the write
+        // ack proceed to CORE_WRITEBACK, which advances Rd by Rs.
+        mem_read_active = 1'b1;
+        mem_addr = drav_linear_q;
+        mem_size = io_psize[FIELD_SIZE_WIDTH-1:0];
+        if (!drav_substep_q) begin
+          mem_we_int = 1'b0;            // read the destination pixel
+          // SRT NOTE: dest read deliberately unconverted (would clobber the
+          // latched row); gospel DRAV under SRT is a bare shiftreg write
+          // (write_pixel_shiftreg, tms34010.cpp:937-967). See CORE_FILL.
+        end else begin
+          mem_we_int = 1'b1;           // write the merged pixel
+          mem_wdata  = drav_merged;
+          // SRT: pixel write -> register-to-memory row transfer (data
+          // discarded by the memory system; 34010gfx.hxx:223-230).
+          mem_srt    = srt_on;
+        end
+        if (mem_ack && drav_substep_q)
+          state_d = CORE_WRITEBACK;
+        else
+          state_d = CORE_DRAV;
+      end
+
+      CORE_LINE_SETUP1: state_d = CORE_LINE_SETUP2;
+      CORE_LINE_SETUP2: state_d = CORE_LINE_SETUP3;
+      CORE_LINE_SETUP3:
+        // A windowed (W=3) LINE reads WSTART/WEND first. If COUNT is 0 there is
+        // nothing to draw; go straight to writeback.
+        state_d = (line_count_q == '0) ? CORE_LINE_WB_D
+                : line_win_en           ? CORE_LINE_SETUP_WIN : CORE_LINE_DRAW;
+      CORE_LINE_SETUP_WIN: state_d = CORE_LINE_DRAW;
+
+      CORE_LINE_DRAW: begin
+        // Per-pixel RMW at DADDR's linear address: read dest (sub-step 0), write
+        // the merged COLOR1 (sub-step 1). On the write ack of the last pixel
+        // (COUNT about to reach 0) go to writeback; else draw the next pixel.
+        mem_read_active = 1'b1;
+        mem_addr = line_linear;
+        mem_size = io_psize[FIELD_SIZE_WIDTH-1:0];
+        if (!line_substep_q) begin
+          mem_we_int = 1'b0;            // read the destination pixel
+        end else begin
+          mem_we_int = 1'b1;           // write the merged pixel
+          mem_wdata  = line_merged;
+        end
+        // Stop on the last pixel OR a W=1/W=2 window-violation abort.
+        if (mem_ack && line_substep_q && ((line_count_q == 32'd1) || line_abort))
+          state_d = CORE_LINE_WB_D;
+        else
+          state_d = CORE_LINE_DRAW;
+      end
+
+      CORE_LINE_WB_D:     state_d = CORE_LINE_WB_DADDR; // write d  -> B0
+      CORE_LINE_WB_DADDR: state_d = CORE_LINE_WB_COUNT; // write DADDR -> B2
+      CORE_LINE_WB_COUNT: state_d = CORE_FETCH;         // write COUNT -> B10, then fetch
+
+      CORE_FILL: begin
+        // Per pixel, read the destination (sub-step 0) then write the merged
+        // value (sub-step 1): merged = PPOP(COLOR1, dest) plane-masked and
+        // transparency-checked. The memory model RMW handles sub-word /
+        // straddling pixels. Stay until the array's last write completes.
+        mem_read_active = 1'b1;
+        mem_addr  = fill_addr_q;
+        mem_size  = io_psize[FIELD_SIZE_WIDTH-1:0];
+        if (!fill_substep_q) begin
+          mem_we_int = 1'b0;            // read the destination pixel
+          // SRT NOTE: this dest read is deliberately NOT converted. Gospel
+          // FILL under SRT issues ONLY the shiftreg write (MAME 0.280
+          // 34010gfx.hxx:1809-1814: FILL's own DPYCTL bit-11 check goes
+          // straight to shiftreg_w, no dest read; UG p252 PSIZE=16 "so that
+          // the write cycle is not preceded by a read"). Converting it would
+          // clobber the latched row with the DESTINATION rows. The extra
+          // plain read is side-effect-free (the SRT write below discards
+          // data) — a documented timing-only deviation (assumptions.md).
+        end else begin
+          mem_we_int = 1'b1;            // write the processed pixel
+          mem_wdata  = fill_merged;
+          // SRT: DPYCTL.SRT=1 converts each FILL pixel write into a
+          // register-to-memory row transfer (MAME 0.280 34010gfx.hxx:
+          // 1809-1814 -> shiftreg_w; the data operand is discarded,
+          // 34010gfx.hxx:223-230). This is the NBA/UMK3 DIRQ page-erase
+          // primitive (MAIN.ASM:638 PIXT latch + :727 FILL L).
+          mem_srt    = srt_on;
+        end
+        if (mem_ack && fill_substep_q && fill_done)
+          state_d = CORE_FILL_WB;
+        else
+          state_d = CORE_FILL;
+      end
+
+      CORE_FILL_WB: begin
+        // Write the final DADDR back to B2, then fetch the next instruction.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_PBLT_SETUP: begin
+        // One cycle to latch SPTCH/DPTCH (counters seeded at EXECUTE). The
+        // binary form reads COLOR0/COLOR1 in a second setup cycle; a windowed
+        // (W=3) XY blt reads WSTART/WEND in CORE_PBLT_SETUP_WIN.
+        // P0006: a zero-dimension array transfers no pixels (TMS34010 UG:
+        // "if either dimension of the array is 0, no pixels are transferred").
+        // Without this, pblt_done's `pblt_dy_q - 1` underflows to 0xFFFF and the
+        // blt runs 65536 rows -> hang. Real games issue DYDX=0 for blank tiles.
+        state_d = (pblt_dx_q == 16'd0 || pblt_dy_q == 16'd0)  ? CORE_FETCH
+                : decoded.blt_binary                          ? CORE_PBLT_SETUP2
+                : (pblt_win_en_q || pblt_w2_q || pblt_w1_q)   ? CORE_PBLT_SETUP_WIN
+                                                              : CORE_PBLT;
+      end
+
+      CORE_PBLT_SETUP2: begin
+        // Latch COLOR0/COLOR1 for the color-expand source.
+        state_d = (pblt_win_en_q || pblt_w2_q || pblt_w1_q) ? CORE_PBLT_SETUP_WIN
+                                                            : CORE_PBLT;
+      end
+
+      CORE_PBLT_SETUP_WIN: begin
+        // Latch WSTART(B5)/WEND(B6). W=3 proceeds to the per-pixel-clipped blt;
+        // W=2 (miss detection) checks array containment now — draw only if the
+        // whole array is inside, else skip to CORE_PBLT_WIN_MISS (no draw).
+        // W=1 (hit detection) never draws — go straight to CORE_PBLT_WIN_HIT.
+        state_d = pblt_w1_q                         ? CORE_PBLT_WIN_HIT
+                : (pblt_w2_q && !pblt_array_inside) ? CORE_PBLT_WIN_MISS
+                                                    : CORE_PBLT;
+      end
+
+      CORE_PBLT_WIN_MISS: begin
+        // W=2 window miss: no pixels drawn; V=1 and WVP set, then fetch.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_PBLT_WIN_HIT: begin
+        // W=1 hit detection: no pixels drawn; V/WVP from pblt_array_hit, fetch.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_PBLT: begin
+        // Per pixel: read source (sub-step 0), read destination (1), write the
+        // processed pixel (2). Stay until the array's last write completes.
+        // The binary source is read 1 bit at a time; otherwise PSIZE bits.
+        mem_read_active = 1'b1;
+        mem_size  = io_psize[FIELD_SIZE_WIDTH-1:0];
+        unique case (pblt_substep_q)
+          2'd0: begin
+            mem_we_int = 1'b0;             // read source pixel (1 bit if binary)
+            mem_addr   = pblt_src_addr_q;
+            if (decoded.blt_binary) mem_size = FIELD_SIZE_WIDTH'(1);
+          end
+          2'd1: begin
+            mem_we_int = 1'b0;             // read destination pixel
+            mem_addr   = pblt_dst_addr_q;
+          end
+          default: begin
+            mem_we_int = 1'b1;             // write the processed pixel
+            mem_addr   = pblt_dst_addr_q;
+            mem_wdata  = pblt_merged;
+          end
+        endcase
+        if (mem_ack && pblt_substep_q == 2'd2 && pblt_done)
+          state_d = CORE_PBLT_WB;
+        else
+          state_d = CORE_PBLT;
+      end
+
+      CORE_PBLT_WB: begin
+        // Write the final SADDR back to B0.
+        state_d = CORE_PBLT_WB2;
+      end
+
+      CORE_PBLT_WB2: begin
+        // Write the final DADDR back to B2, then fetch the next instruction.
+        state_d = CORE_FETCH;
+      end
+
+      CORE_MEMORY: begin
+        // Memory transaction state for instructions that set
+        // decoded.needs_memory_op. The IF signals (mem_req, mem_we_int,
+        // mem_addr, mem_size, mem_wdata) are driven per iclass.
+        unique case (decoded.iclass)
+          INSTR_PUSHST: begin
+            // Write ST to mem[new SP] as a 32-bit transfer.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b1;
+            mem_addr  = alu_result;        // = SP - 32
+            mem_size  = MEM_SIZE_32;
+            mem_wdata = st_value;          // ST
+          end
+          INSTR_POPST: begin
+            // Read 32-bit ST from mem[OLD SP]. The increment-by-32
+            // happens via the ALU; we don't want alu_result here,
+            // we want the pre-increment SP value. POPST has
+            // rd_idx=15 (SP) on rs2 — so rs2 gives OLD SP.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_addr  = rf_rs2_data;       // = current SP
+            mem_size  = MEM_SIZE_32;
+          end
+          INSTR_CALL_RS,
+          INSTR_CALLA,
+          INSTR_CALLR: begin
+            // Push PC' to mem[new SP]. new SP = alu_result = SP - 32.
+            // pc_value at this point is PC' — the address of the
+            // first instruction AFTER the CALL's full encoding:
+            //   CALL Rs:  PC + 16 bits  (single-word opcode)
+            //   CALLR:    PC + 32 bits  (opcode + 16-bit disp)
+            //   CALLA:    PC + 48 bits  (opcode + 16-bit LO + 16-bit HI)
+            // All three increments have already happened by the time
+            // we enter CORE_MEMORY (via the FETCH / FETCH_IMM_LO /
+            // FETCH_IMM_HI advances).
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b1;
+            mem_addr  = alu_result;        // = SP - 32
+            mem_size  = MEM_SIZE_32;
+            mem_wdata = pc_value;          // PC' (return address)
+          end
+          INSTR_RETS: begin
+            // Pop PC from mem[OLD SP]. mem_addr = current SP value
+            // (rf_rs2_data) — NOT alu_result, which is SP + 32 + 16*N.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_addr  = rf_rs2_data;       // = current SP
+            mem_size  = MEM_SIZE_32;
+          end
+          INSTR_RETI: begin
+            // Two-step pop: step 0 reads ST from mem[SP]; step 1 reads
+            // PC from mem[SP+32]. Both 32-bit reads. The latched
+            // popped_st_q / popped_pc_q values flow to the WRITEBACK
+            // ST-write and PC-load paths below.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_size  = MEM_SIZE_32;
+            mem_addr  = (mem_op_step == 2'd0)
+                      ? rf_rs2_data                  // = SP
+                      : (rf_rs2_data + WORD_BIT_SIZE);      // = SP + 32
+          end
+          INSTR_TRAP: begin
+            // Three-step sequence for N>0 — see SPVU001A page 12-252:
+            //   step 0: write PC' at SP-32       (push return address)
+            //   step 1: write ST  at SP-64       (push status reg)
+            //   step 2: read trap vector @ V_N   (= 0xFFFFFFE0 - N*32)
+            // SP itself is updated via alu_result (= SP - 64) at
+            // WRITEBACK; ST is replaced with 0x00000010; PC is loaded
+            // from popped_pc_q (latched on step 2).
+            //
+            // For TRAP 0 (`trap_skip_push`): collapse to a single step
+            // that is the vector fetch — no pushes (per spec note 1
+            // page 12-253). SP stays unchanged (alu_b=0 above).
+            mem_read_active = 1'b1;
+            mem_size  = MEM_SIZE_32;
+            if (trap_skip_push) begin
+              mem_we_int    = 1'b0;
+              mem_addr  = TRAP_VECTOR_BASE;        // N=0 ⇒ vector @ 0xFFFFFFE0
+            end else begin
+              unique case (mem_op_step)
+                2'd0: begin
+                  mem_we_int    = 1'b1;
+                  mem_addr  = rf_rs2_data - WORD_BIT_SIZE;
+                  mem_wdata = pc_value;             // PC'
+                end
+                2'd1: begin
+                  mem_we_int    = 1'b1;
+                  mem_addr  = rf_rs2_data - WORD_BIT_SIZE_2;
+                  mem_wdata = st_value;             // ST as it stood
+                end
+                default: begin                       // step 2
+                  mem_we_int    = 1'b0;
+                  // Trap-vector address = TRAP_VECTOR_BASE - N*32.
+                  // N is decoded.k5 (5 bits); N*32 = N << 5.
+                  mem_addr  = TRAP_VECTOR_BASE
+                            - ({{(ADDR_WIDTH-5){1'b0}}, decoded.k5} << 5);
+                end
+              endcase
+            end
+          end
+          INSTR_MMTM: begin
+            // Push the register currently selected by mm_iter_idx to
+            // mem[mm_rp_q]. Each iteration of CORE_MEMORY is one 32-bit
+            // write; mm_mask_q and mm_rp_q advance on the ack. We stay
+            // in CORE_MEMORY until the mask is empty.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b1;
+            mem_addr  = mm_rp_q;
+            mem_size  = MEM_SIZE_32;
+            mem_wdata = rf_rs1_data;       // = value of register R(mm_iter_idx)
+          end
+          INSTR_MMFM: begin
+            // Pop: read 32 bits from mem[mm_rp_q] into the register
+            // selected by mm_iter_idx (highest-order first). The regfile
+            // write happens via the mmfm_pop_wr path; here we just drive
+            // the read. mm_mask_q clears the bit and mm_rp_q advances
+            // (+32) on the ack. Stay in CORE_MEMORY until mask empty.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_addr  = mm_rp_q;
+            mem_size  = MEM_SIZE_32;
+          end
+          INSTR_MOVE_FIELD_STORE: begin
+            // MOVE Rs,*Rd[+|-]: write the low FS bits of Rs (rf_rs1_data) to
+            // mem[mv_addr]. mv_addr = pointer Rd (postinc/none) or Rd-FS
+            // (predec); the pointer auto-update (Rd±FS) is written back at
+            // WRITEBACK for the inc/dec forms. FS from the F-selected ST pair.
+            // A PIXT store (pixt_rmw) is a 2-step plane-mask read-modify-write:
+            // step 0 reads the destination pixel, step 1 writes the merged
+            // value. A regular MOVE store (and PMASK=0 PIXT) is a single write.
+            mem_read_active = 1'b1;
+            mem_addr  = mv_addr;           // = Rd or Rd-FS (predec)
+            mem_size  = mv_fs;             // field size (1..32)
+            if (pixt_rmw && mem_op_step == 2'd0) begin
+              mem_we_int = 1'b0;           // step 0: read the destination pixel
+              // SRT NOTE: dest read deliberately unconverted (see CORE_FILL);
+              // gospel PIXT store under SRT is a bare shiftreg write.
+            end else begin
+              mem_we_int = 1'b1;           // write (single, or step 1 of RMW)
+              mem_wdata  = pixt_rmw ? pixt_merged : rf_rs1_data;
+              // SRT: a PIXT Rs,*Rd pixel write converts to a register-to-
+              // memory row transfer (write_pixel_shiftreg, tms34010.cpp:
+              // 937-967; data discarded). force_pixel keeps ordinary MOVE
+              // field stores unconverted (gospel: only pixel ops reroute).
+              if (decoded.force_pixel) mem_srt = srt_on;
+            end
+          end
+          INSTR_MOVE_FIELD_LOAD: begin
+            // MOVE [-]*Rs[+],Rd: read an FS-bit field from mem[mv_addr].
+            // mv_addr = pointer Rs (postinc/none) or Rs-FS (predec). The
+            // field-extended data is latched (mv_load_data_q) on this same
+            // ack and goes to Rd at WRITEBACK; for inc/dec the updated
+            // pointer Rs±FS is written via the mv_load_ptr_wr path on this
+            // ack.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_addr  = mv_addr;           // = Rs or Rs-FS (predec)
+            mem_size  = mv_fs;             // field size (1..32)
+            // SRT: a PIXT *Rs,Rd pixel read converts to a memory-to-register
+            // row latch; rdata returns the FIRST latched word (MAME 0.280
+            // read_pixel_shiftreg returns m_shiftreg[0]; tms34010.cpp:937-967,
+            // 34010ops.hxx:242-251 PIXT_IR -> RPIXEL). This is the MAIN.ASM:638
+            // "pixt *a2,a2" erase-source latch. force_pixel keeps ordinary
+            // MOVE field loads unconverted.
+            if (decoded.force_pixel) mem_srt = srt_on;
+          end
+          INSTR_MOVE_OFF_STORE: begin
+            // MOVE Rs,*Rd(off): write the low FS bits of Rs (rf_rs1_data) to
+            // mem[Rd + off]. imm32 = sign-extended 16-bit offset; Rd =
+            // rf_rs2_data. Field-size aware (Task 0078); no pointer step.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b1;
+            mem_addr  = SHARED_ADDRESS ? shared_address_sum : rf_rs2_data + imm32;
+            mem_size  = mv_fs;             // field size (1..32)
+            mem_wdata = rf_rs1_data;       // = Rs (low FS bits used)
+          end
+          INSTR_MOVE_OFF_LOAD: begin
+            // MOVE *Rs(off),Rd: read an FS-bit field at mem[Rs + off];
+            // field-extended result -> Rd at WRITEBACK. Rs = rf_rs1_data
+            // (pointer); imm32 = sext(off16). Field-size aware (Task 0078).
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_addr  = SHARED_ADDRESS ? shared_address_sum : rf_rs1_data + imm32;
+            mem_size  = mv_fs;             // field size (1..32)
+          end
+          INSTR_MOVE_ABS_STORE: begin
+            // MOVE Rs,@DAddr: write the low FS bits of Rs (rf_rs1_data) to the
+            // absolute bit address imm32 = {imm_hi_q, imm_lo_q}. Field-size
+            // aware (Task 0078).
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b1;
+            mem_addr  = imm32;
+            mem_size  = mv_fs;             // field size (1..32)
+            mem_wdata = rf_rs1_data;       // = Rs (low FS bits used)
+          end
+          INSTR_MOVE_ABS_LOAD: begin
+            // MOVE @SAddr,Rd: read an FS-bit field from the absolute address
+            // imm32; the field-extended result goes to Rd at WRITEBACK
+            // (rf_wr_data mux), flags from the extended value. Task 0078.
+            mem_read_active = 1'b1;
+            mem_we_int    = 1'b0;
+            mem_addr  = imm32;
+            mem_size  = mv_fs;             // field size (1..32)
+          end
+          INSTR_MOVE_FIELD_M2M: begin
+            // Two-step indirect-to-indirect: step 0 reads an FS-bit field at
+            // mem[*Rs] into move_data_q, step 1 writes its low FS bits to
+            // mem[*Rd]. Field-size aware (Task 0079): both transactions use
+            // mem_size = mv_fs and the pointers step by ±FS (m2m_*_addr fold
+            // in the predec -FS). No FE extension — this is mem->mem, no
+            // register destination. For inc/dec the pointers are updated via
+            // the m2m_src_wr / WRITEBACK paths.
+            mem_read_active = 1'b1;
+            mem_size  = mv_fs;             // field size (1..32)
+            // SRT: PIXT *Rs,*Rd converts BOTH pixel accesses (read_pixel_
+            // shiftreg + write_pixel_shiftreg, tms34010.cpp:937-967): step 0
+            // latches the source row, step 1 transfers it to the destination
+            // (write data discarded) — a whole-row copy, exactly the gospel
+            // pairing. Ordinary MOVE *Rs,*Rd (no force_pixel) never converts.
+            if (decoded.force_pixel) mem_srt = srt_on;
+            if (mem_op_step == 2'd0) begin
+              mem_we_int   = 1'b0;
+              mem_addr = m2m_src_addr;     // = Rs (or Rs-FS predec)
+            end else begin
+              mem_we_int   = 1'b1;
+              mem_addr = m2m_dst_addr;     // = Rd (or Rd-FS predec; updated Rs if Rs==Rd)
+              mem_wdata = move_data_q;     // field (low FS bits) read in step 0
+            end
+          end
+          INSTR_MOVE_ABS_M2M: begin
+            // P0014: two-step absolute mem->mem. Step 0 reads an FS-bit field
+            // at SAddr (imm32) into move_data_q; step 1 writes it to DAddr
+            // (imm2_32). FS from the F-selected ST pair (mv_fs). No FE
+            // extension (mem->mem), no register/pointer writeback, flags Unaff.
+            mem_read_active = 1'b1;
+            mem_size  = mv_fs;
+            if (mem_op_step == 2'd0) begin
+              mem_we_int = 1'b0;
+              mem_addr   = imm32;          // SAddr
+            end else begin
+              mem_we_int = 1'b1;
+              mem_addr   = imm2_32;        // DAddr
+              mem_wdata  = move_data_q;    // field (low FS bits) read in step 0
+            end
+          end
+          INSTR_MOVE_OFF_M2M: begin
+            // P0015: two-step offset mem->mem. Step 0 reads the FS-bit field at
+            // mem[Rs + sext(SOff)] (imm32 = sext(imm_lo) via the needs_imm16 +
+            // sign-extend path) into move_data_q; step 1 writes it to
+            // mem[Rd + sext(DOff)] (imm2_off_sext). Pointers unchanged.
+            mem_read_active = 1'b1;
+            mem_size  = mv_fs;
+            if (mem_op_step == 2'd0) begin
+              mem_we_int = 1'b0;
+              mem_addr   = SHARED_ADDRESS ? shared_address_sum : rf_rs1_data + imm32;          // Rs + sext(SOff)
+            end else begin
+              mem_we_int = 1'b1;
+              mem_addr   = SHARED_ADDRESS ? shared_address_sum : rf_rs2_data + imm2_off_sext;  // Rd + sext(DOff)
+              mem_wdata  = move_data_q;
+            end
+          end
+          INSTR_MOVE_OFF_M2M_POST: begin
+            // MOVE *Rs(SOff),*Rd+: read at Rs+signed offset, write at Rd,
+            // then WRITEBACK advances only the destination pointer by FS.
+            mem_read_active = 1'b1;
+            mem_size = mv_fs;
+            if (mem_op_step == 2'd0) begin
+              mem_we_int = 1'b0;
+              mem_addr   = SHARED_ADDRESS ? shared_address_sum : rf_rs1_data + imm32;
+            end else begin
+              mem_we_int = 1'b1;
+              mem_addr   = rf_rs2_data;
+              mem_wdata  = move_data_q;
+            end
+          end
+          INSTR_MOVE_ABS_M2M_POST: begin
+            // MOVE @SAddr,*Rd+: read at the absolute source address, write
+            // at Rd, then WRITEBACK advances the destination pointer by FS.
+            mem_read_active = 1'b1;
+            mem_size = mv_fs;
+            if (mem_op_step == 2'd0) begin
+              mem_we_int = 1'b0;
+              mem_addr   = imm32;
+            end else begin
+              mem_we_int = 1'b1;
+              mem_addr   = rf_rs2_data;
+              mem_wdata  = move_data_q;
+            end
+          end
+          default: ;  // no transaction (shouldn't reach with needs_memory_op=0)
+        endcase
+        if (mem_ack) begin
+          // Multi-step instructions stay in CORE_MEMORY until their
+          // final step's ack; everything else transitions on every ack.
+          unique case (decoded.iclass)
+            INSTR_RETI: if (mem_op_step == 2'd1) state_d = CORE_WRITEBACK;
+            INSTR_TRAP: if (trap_skip_push || mem_op_step == 2'd2)
+                          state_d = CORE_WRITEBACK;
+            INSTR_MMTM,
+            INSTR_MMFM: if (mm_mask_will_be_empty) state_d = CORE_WRITEBACK;
+            INSTR_MOVE_FIELD_M2M,
+            INSTR_MOVE_ABS_M2M,                                                     // P0014
+            INSTR_MOVE_OFF_M2M,
+            INSTR_MOVE_OFF_M2M_POST,
+            INSTR_MOVE_ABS_M2M_POST: if (mem_op_step == 2'd1) state_d = CORE_WRITEBACK;
+            // PIXT store RMW stays for its write step; single-step store exits.
+            INSTR_MOVE_FIELD_STORE:
+                        if (!pixt_rmw || mem_op_step == 2'd1) state_d = CORE_WRITEBACK;
+            default:    state_d = CORE_WRITEBACK;
+          endcase
+        end
+      end
+
+      CORE_WRITEBACK: begin
+        // An even-Rd multiply/divide needs a second writeback cycle to
+        // store the low half (product LSBs / divide remainder) into Rd+1.
+        state_d = pair_second_pass ? CORE_WRITEBACK : CORE_FETCH;
+      end
+
+      default: begin
+        // Defensive: any out-of-range encoding goes back to reset.
+        state_d = CORE_RESET;
+      end
+    endcase
+  end
+
+  assign state_o          = state_q;
+  assign pc_o             = pc_value;
+  assign instr_word_o     = instr_word_q;
+  assign illegal_opcode_o = illegal_q;
+
+endmodule : tms34010_core
+`default_nettype wire

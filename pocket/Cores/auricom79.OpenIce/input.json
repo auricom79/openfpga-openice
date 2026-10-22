@@ -1,0 +1,67 @@
+{
+  "input": {
+    "magic": "APF_VER_1",
+    "controllers": [
+      {
+        "type": "default",
+        "mappings": [
+          {
+            "id": 0,
+            "name": "Turbo",
+            "key": "pad_btn_a"
+          },
+          {
+            "id": 1,
+            "name": "Tir / Blocage",
+            "key": "pad_btn_b"
+          },
+          {
+            "id": 2,
+            "name": "Passe / Intercept.",
+            "key": "pad_btn_x"
+          },
+          {
+            "id": 6,
+            "name": "Start",
+            "key": "pad_btn_start"
+          },
+          {
+            "id": 7,
+            "name": "Credit",
+            "key": "pad_btn_select"
+          }
+        ]
+      },
+      {
+        "type": "default",
+        "mappings": [
+          {
+            "id": 0,
+            "name": "Turbo",
+            "key": "pad_btn_a"
+          },
+          {
+            "id": 1,
+            "name": "Tir / Blocage",
+            "key": "pad_btn_b"
+          },
+          {
+            "id": 2,
+            "name": "Passe / Intercept.",
+            "key": "pad_btn_x"
+          },
+          {
+            "id": 6,
+            "name": "Start",
+            "key": "pad_btn_start"
+          },
+          {
+            "id": 7,
+            "name": "Credit",
+            "key": "pad_btn_select"
+          }
+        ]
+      }
+    ]
+  }
+}

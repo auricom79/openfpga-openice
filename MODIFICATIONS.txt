@@ -1,0 +1,60 @@
+Pocket adaptation changes, prepared 18–20 October 2026
+Public source snapshot published 22 October 2026
+
+The following files differ from their pinned upstream baselines. This is a
+Pocket adaptation; do not treat these copies as pristine upstream versions.
+Changes include CPU/DCS area and clock-enable adaptation, physical memory
+controllers/arbitration, framebuffer publication and reset/loading integration.
+Original licenses and attribution remain in force. All preferred source inputs
+and effective project constraints are available in this repository.
+
+modified: src/upstream/wolf-unit/rtl/tms34010/rtl/core/tms34010_alu.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/tms34010/rtl/core/tms34010_core.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/tms34010/rtl/core/tms34010_regfile.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/tms34010/rtl/core/tms34010_shifter.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/tms34010/rtl/io/tms34010_io_regs.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/tms34010/rtl/video/tms34010_video.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_mem.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_dma.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/sdram/stv_vram_ddr_top.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/sdram/wolf_gfx_ddr_top.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/sdram/wolf_dcs_ddr_top.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_memsys.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/dcs/adsp2105.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_dcs_board.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_video.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_video_top.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/sdram/sdram_stock.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/wolf_top.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/pocket-utils/ip/mem/psram.sv
+  base: pocket-utils @ 78482d1b363606336f4535aa0adc2e957bc20558
+modified: src/upstream/wolf-unit/rtl/dcs/dcs_mem.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+added: src/upstream/wolf-unit/rtl/dcs/dcs_ce_ram.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+
+New Pocket adapter/tool files marked SPDX MIT are covered by
+licenses/MIT-adapters.txt. The APF interface/core_top retains its template
+provenance as described in NOTICE.txt.
+
+For public packaging, three absolute source paths in generated diagnostic
+strings were changed to relative src/ paths. The supplied FPGA bitstream
+was not changed. See source-manifest.json for both generated-file hashes.

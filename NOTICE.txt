@@ -1,0 +1,58 @@
+NHL Open Ice for Analogue Pocket — third-party notices
+
+This project is a Pocket adaptation of Wolf Unit, not an original implementation
+of every component. The combined project is distributed under GNU GPL version 3,
+following the Wolf Unit upstream declaration. Individual component licenses and
+notices are retained and are not replaced by the top-level GPL text.
+
+Wolf Unit — blahm1d and contributors
+  https://github.com/blahm1d/wolf-unit
+  Baseline commit acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+  Modified files are supplied in src/upstream/wolf-unit.
+  The upstream README is retained in licenses/wolf-unit-upstream-README.md.
+  Pocket changes include memory arbitration/adaptation, area optimizations of
+  CPU and DCS logic, framebuffer publication, loader/reset integration and I/O.
+  A generated combined Verilog file is also supplied with its preferred sources.
+
+TMS34010 — Copyright (c) 2026 Kevin Coleman, MIT
+  See licenses/TMS34010-MIT.txt and original source headers.
+
+SDRAM — Copyright (c) 2015-2019 Sorgelig, GNU GPL version 3
+  See src/upstream/wolf-unit/rtl/sdram/sdram_stock.sv and its original notice.
+
+Analogue Pocket utilities — Copyright (c) 2022 Adam Gastineau, MIT
+  https://github.com/agg23/analogue-pocket-utils
+  Baseline commit 78482d1b363606336f4535aa0adc2e957bc20558
+  See licenses/pocket-utils-MIT.txt and src/upstream/pocket-utils.
+  The legacy utility source is retained in the recorded source inventory;
+  the deployed port uses the Pocket-specific PSRAM backend.
+
+Analogue Pocket Framework (APF) — Analogue Enterprises Limited
+  https://github.com/open-fpga/core-template
+  Baseline commit da3a021b1eaf742604d86d8dc9b33a6666263e6a
+  Framework files remain in quartus/apf and quartus/core, with their full
+  original notices. The APF notice includes a clause giving applicable MIT/GPL
+  terms precedence where required. See those headers and the linked APF EULA.
+
+Intel/Altera IP and project wrappers
+  Quartus QPF/QSF, generated memory and DDIO wrappers retain the Intel license
+  notices in their headers. The proprietary synthesis tools, simulation model
+  libraries and installers are not distributed here. Target: Intel Cyclone V.
+
+MAME development team
+  ROM names and verification hashes were checked against the MAME Open Ice
+  definition (midwunit.cpp); stream order was checked against the upstream MRA.
+  MAME was also used as a behavioral reference during development. No MAME
+  emulator source or game ROM payload is included in this release.
+
+New files marked SPDX-License-Identifier: MIT
+  Copyright (c) 2026 Open Ice Pocket contributors.
+  See licenses/MIT-adapters.txt. These files do not relicense third-party code.
+
+Pocket integration and hardware testing: auricom79, with OpenAI Codex assistance.
+Public documentation and packaging prepared 22 October 2026. The FPGA bitstream
+is the unchanged test.4 build tested on 20 October 2026.
+
+No game ROMs, game audio, game graphics or ROM-download service are supplied.
+Game names identify compatibility; this is not an official Analogue, Midway or
+NHL product. See README.md and BUILDING.md for limitations and source details.

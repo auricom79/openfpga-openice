@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+dist/
+build/
+prepared-assets/
+quartus/db/
+quartus/incremental_db/
+quartus/output_files/
+quartus/*.rpt
+quartus/*.summary
+quartus/*.smsg
+quartus/*.qws
+quartus/*.jdi
+quartus/*.qdf
+quartus/*.pin
+quartus/*.sof
+quartus/*.rbf
+quartus/*.eda.*
+# Game ROMs must never be committed.
+*.bin
+*.zip
+*.u*
+*.rom
+.DS_Store
