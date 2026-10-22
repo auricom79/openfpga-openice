@@ -1,5 +1,7 @@
 # NHL Open Ice for Analogue Pocket
 
+![NHL Open Ice cover](docs/images/openice-cover.jpg)
+
 An experimental openFPGA port of **NHL Open Ice: 2 on 2 Challenge**, revision **1.21**, for Analogue Pocket. Based on [blahm1d/wolf-unit](https://github.com/blahm1d/wolf-unit), with Pocket-specific memory, loading, video, audio and controller integration.
 
 [Instructions en français](README.fr.md)
@@ -8,7 +10,7 @@ The `0.1.0-test.4` FPGA bitstream has been tested on a physical Pocket: the game
 
 ## Install
 
-1. Download **`auricom79.OpenIce_0.1.0-test.4.zip`** from [Releases](https://github.com/auricom79/openfpga-openice/releases). The automatically generated GitHub source archives are for development.
+1. Download **`auricom79.OpenIce_0.1.0-test.4.1.zip`** from [Releases](https://github.com/auricom79/openfpga-openice/releases). The automatically generated GitHub source archives are for development.
 2. Extract the release ZIP into the root of the Pocket microSD card, merging `Cores`, `Platforms` and `Assets`. The core folder is `Cores/auricom79.OpenIce`.
 3. Supply your own **Open Ice revision 1.21** ROM set, either `openice.zip` or an extracted directory. Prepare the assets with Python 3.9 or newer. No extra Python packages are needed.
 

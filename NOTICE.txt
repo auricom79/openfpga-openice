@@ -53,6 +53,10 @@ Pocket integration and hardware testing: auricom79, with OpenAI Codex assistance
 Public documentation and packaging prepared 22 October 2026. The FPGA bitstream
 is the unchanged test.4 build tested on 20 October 2026.
 
-No game ROMs, game audio, game graphics or ROM-download service are supplied.
+No game ROMs, extracted game audio/graphics or ROM-download service are supplied.
+The cover artwork in docs/images/openice-cover.jpg was provided by auricom79
+for the project presentation. The Pocket menu image is a monochrome format
+conversion of that cover. Artwork and trademarks remain the property of their
+respective holders and are not relicensed under the software GPL/MIT licenses.
 Game names identify compatibility; this is not an official Analogue, Midway or
 NHL product. See README.md and BUILDING.md for limitations and source details.

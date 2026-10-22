@@ -3,6 +3,8 @@ src/** -text
 quartus/** -text
 licenses/** -text
 *.rbf_r binary
+*.bin binary
+*.jpg binary
 *.py text eol=lf
 *.md text eol=lf
 *.json text eol=lf

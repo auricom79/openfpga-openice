@@ -16,6 +16,8 @@ def release_files():
                  'variants.json', 'video.json', 'bitstream.rbf_r'):
         files[f'{CORE}/{name}'] = (ROOT / 'pocket' / CORE / name).read_bytes()
     files['Platforms/openice.json'] = (ROOT / 'pocket/Platforms/openice.json').read_bytes()
+    files['Platforms/_images/openice.bin'] = (ROOT / 'pocket/Platforms/_images/openice.bin').read_bytes()
+    files[f'{CORE}/docs/images/openice-cover.jpg'] = (ROOT / 'docs/images/openice-cover.jpg').read_bytes()
     for name in ('prepare_roms.py', 'roms.json'):
         files[f'{CORE}/tools/{name}'] = (ROOT / 'tools' / name).read_bytes()
     for name in ('README.md', 'README.fr.md', 'BUILDING.md', 'MODIFICATIONS.txt', 'NOTICE.txt', 'LICENSE'):
@@ -30,7 +32,9 @@ def release_files():
     ).encode()
     expected = json.loads((ROOT / 'source-manifest.json').read_text())['bitstream']['sha256']
     assert hashlib.sha256(files[f'{CORE}/bitstream.rbf_r']).hexdigest() == expected
-    assert all(not name.endswith(('.bin', '.rom', '.hex')) for name in files)
+    assert all(name == 'Platforms/_images/openice.bin' or not name.endswith(('.bin', '.rom', '.hex')) for name in files)
+    platform_image = files['Platforms/_images/openice.bin']
+    assert len(platform_image) == 521 * 165 * 2 and not any(platform_image[1::2])
     return files
 
 

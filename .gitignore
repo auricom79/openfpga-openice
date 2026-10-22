@@ -18,6 +18,7 @@ quartus/*.rbf
 quartus/*.eda.*
 # Game ROMs must never be committed.
 *.bin
+!pocket/Platforms/_images/openice.bin
 *.zip
 *.u*
 *.rom

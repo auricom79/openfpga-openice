@@ -55,6 +55,8 @@ The packager reads an explicit list of files. It includes the bitstream, APF met
 
 The unit tests use synthetic byte strings, not copyrighted game data. They verify rejected checksums and missing/duplicate inputs, ZIP handling and preservation of different existing output files. On the development machine, the preparation script was additionally checked against the supplied revision 1.21 ROMs; its three output hashes matched the assets used in the Pocket test.
 
+The `0.1.0-test.4.1` packaging update adds the supplied cover and a Pocket platform image; its FPGA bitstream is identical to test.4. `Platforms/_images/openice.bin` is an APF menu bitmap, not a ROM. It is explicitly allowlisted by the packager. To rebuild that image only, install Pillow and run `python3 tools/build_platform_image.py`. This optional artwork dependency is not needed for preparing ROM assets, validating the core or creating a release from the checked-in files.
+
 ## Validation scope
 
 The original development work included functional simulations, four-corner timing analysis and memory-interface review. Hardware gameplay and sound were reported by auricom79 on 20 October 2026. Those observations are distinct from automated tests. The public CI checks source identity and packaging tools; it does not emulate a complete match or run Quartus. The private development history, ROMs, VM, raw simulation dumps and machine-specific logs are not part of this repository.
