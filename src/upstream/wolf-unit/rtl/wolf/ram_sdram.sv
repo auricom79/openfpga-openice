@@ -15,6 +15,11 @@
 module ram_sdram #(
   parameter int RAMW = 32'h40000,             // RAM words (0x40000 = 4 Mbit)
   parameter int SD_AW = 25,                    // SDRAM word-address width
+`ifdef POCKET
+  parameter bit FAST_FULL_WRITES = 1'b1,
+`else
+  parameter bit FAST_FULL_WRITES = 1'b0,
+`endif
   parameter [SD_AW-1:0] RAM_BASE = '0          // kept 0; the arbiter adds RAMW_BASE
 )(
   input  logic         clk,
@@ -78,7 +83,12 @@ module ram_sdram #(
           if (req) begin
             we_l<=we; wi<=widx; bo<=boff; szl<=sz; wd_l<=wd;
             o0<=16'h0; o1<=16'h0; o2<=16'h0;
-            idx <= 3'd0; st <= S_RD;             // every access reads first (read / RMW)
+            idx <= 3'd0;
+            // Aligned full-word stores need no old bits. Keep partial fields
+            // on the RMW path, and retain S_WR's bounds checks and completion
+            // after every physical write acknowledgment. Write rdata is unused.
+            st <= (FAST_FULL_WRITES && we && boff == 4'd0 &&
+                   (sz == 6'd16 || sz == 6'd32)) ? S_WR : S_RD;
           end
         end
         S_RD: begin

@@ -1,6 +1,30 @@
 Pocket adaptation changes, prepared 18–20 October 2026
 Public source snapshot published 22 October 2026
 
+Test.5 changes prepared 24–25 October 2026 (Pocket feedback received 25 October):
+- Loading raster with rendered title screenshot, real drained-byte percentage,
+  frame-coherent progress display and switch to the game at vertical sync.
+- Deferred ROM reads increased from 1 KiB to 4 KiB, preserving bounded buffering
+  and physical-write drain before the next request or game start.
+- Pocket yunit_mem_sameclock removes one redundant cooldown CE interval between
+  consecutive CPU memory transactions; other users retain the legacy default.
+- Aligned 16/32-bit RAM stores skip unnecessary old-word reads. Partial fields
+  retain read-modify-write, bounds checks and physical-write acknowledgments.
+- Pocket program reads use a synchronous direct-mapped cache of 64 16-bit words,
+  filled from completed reads and invalidated by loader writes. The original
+  single-word cache remains the default for other hosts.
+- Pocket dense 8-bpp graphics prefetch uses aligned bursts of up to four 64-bit
+  beats in the existing cache slots. The owner drains every response; CPU,
+  demand and download transactions remain single-beat. Other hosts keep the
+  original single-beat prefetch default.
+- No change to CPU clock enable rate, pixel/audio/memory clocks, DMA cadence,
+  publication fences or game ROMs.
+- Synthetic RTL regressions cover these paths and loading-image reproduction.
+  Component timing gains do not establish whole-game performance. The exact
+  compiled image passed four-corner timing and memory-interface review.
+  The Pocket tester confirmed smoother gameplay and the loading display.
+  No quantitative arcade-speed or frame-rate claim is made.
+
 The following files differ from their pinned upstream baselines. This is a
 Pocket adaptation; do not treat these copies as pristine upstream versions.
 Changes include CPU/DCS area and clock-enable adaptation, physical memory
@@ -32,6 +56,12 @@ modified: src/upstream/wolf-unit/rtl/sdram/wolf_dcs_ddr_top.sv
   base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
 modified: src/upstream/wolf-unit/rtl/wolf/wolf_memsys.sv
   base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/wolf/ram_sdram.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/sdram/yunit_sdram_arb.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
+modified: src/upstream/wolf-unit/rtl/yunit/yunit_mem_cdc.sv
+  base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
 modified: src/upstream/wolf-unit/rtl/dcs/adsp2105.sv
   base: wolf-unit @ acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
 modified: src/upstream/wolf-unit/rtl/wolf/wolf_dcs_board.sv
@@ -55,6 +85,7 @@ New Pocket adapter/tool files marked SPDX MIT are covered by
 licenses/MIT-adapters.txt. The APF interface/core_top retains its template
 provenance as described in NOTICE.txt.
 
-For public packaging, three absolute source paths in generated diagnostic
-strings were changed to relative src/ paths. The supplied FPGA bitstream
-was not changed. See source-manifest.json for both generated-file hashes.
+The original test.4 publication normalized three diagnostic paths. For test.5,
+the public generated Verilog and Quartus project inputs are byte-identical to
+the compiled inputs. The released FPGA image is the one tested on Pocket.
+See source-manifest.json for source, project and bitstream hashes.

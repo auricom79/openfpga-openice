@@ -1040,5 +1040,5 @@ set_global_assignment -name ROUTER_EFFORT_MULTIPLIER 2.0
 set_global_assignment -name ROUTER_TIMING_OPTIMIZATION_LEVEL MAXIMUM
 set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT EXTRA
 
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 3
 

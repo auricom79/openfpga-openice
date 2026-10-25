@@ -6,11 +6,13 @@ An experimental openFPGA port of **NHL Open Ice: 2 on 2 Challenge**, revision **
 
 [Instructions en français](README.fr.md)
 
-The `0.1.0-test.4` FPGA bitstream has been tested on a physical Pocket: the game boots, accepts credits, plays and produces sound. This is a community test release, not a claim of complete arcade accuracy or exhaustive validation. No game ROMs are included in this repository or its releases.
+Version **0.1.0-test.5** has been tested on a physical Pocket. The tester confirmed smoother gameplay and a working title-screen loading display on 25 October 2026. Boot, credits, gameplay and sound were established in the earlier test.4 release. This remains a community test release; arcade accuracy and extended stability are not established. No game ROMs are included.
+
+Test.5 replaces the striped loading screen with the title image, a progress bar and a percentage based on completed asset transfers. Memory optimizations reduce CPU waits, speed up aligned RAM writes, cache program words and group dense graphics reads. CPU, video, memory and audio clock rates are unchanged. The reported improvement in gameplay is qualitative; no frame-rate gain or exact arcade-speed claim is made.
 
 ## Install
 
-1. Download **`auricom79.OpenIce_0.1.0-test.4.1.zip`** from [Releases](https://github.com/auricom79/openfpga-openice/releases). The automatically generated GitHub source archives are for development.
+1. Download **`auricom79.OpenIce_0.1.0-test.5.zip`** from [Releases](https://github.com/auricom79/openfpga-openice/releases). The automatically generated GitHub source archives are for development.
 2. Extract the release ZIP into the root of the Pocket microSD card, merging `Cores`, `Platforms` and `Assets`. The core folder is `Cores/auricom79.OpenIce`.
 3. Supply your own **Open Ice revision 1.21** ROM set, either `openice.zip` or an extracted directory. Prepare the assets with Python 3.9 or newer. No extra Python packages are needed.
 
@@ -44,7 +46,7 @@ The `0.1.0-test.4` FPGA bitstream has been tested on a physical Pocket: the game
 
 5. Safely eject the card, insert it in the Pocket and select **openFPGA → NHL Open Ice**.
 
-**Loading takes several minutes in this release.** A striped screen can remain visible while the assets load. During initial testing, allow five minutes without opening the menu before diagnosing a failure; this is a troubleshooting interval, not a measured startup guarantee.
+The title image, progress bar and percentage remain visible while the game files load. Wait for loading to finish without opening the menu. **100% means the asset transfer is complete**; the game then performs its own startup checks. Existing prepared game files can be reused when upgrading.
 
 ## Start playing
 
@@ -65,8 +67,8 @@ If an apparent stuck screen persists, try a complete Pocket power-off and restar
 
 ## Status and limitations
 
-- Gameplay and audible sound were confirmed by the tester on 20 October 2026. An initial possible slowdown report was subsequently withdrawn; performance against an original arcade board has not been measured.
-- Loading is slow and has no progress display yet.
+- Smoother gameplay and the loading display were confirmed on Pocket for test.5 on 25 October 2026. The improvement has not been quantified, and camera behavior has not been separately measured against an arcade board.
+- Startup duration depends on asset loading and the game’s own checks; the progress indicator covers asset loading only.
 - CMOS settings and records are not saved between sessions. Save states and sleep are not supported.
 - Dock capability is declared in the APF metadata and two controllers are mapped, but Dock, multiplayer and analog output have not been validated; analog output is disabled.
 - Only revision 1.21 is supported by the asset preparation tool. Other Wolf Unit games are not supported by this release.
@@ -76,7 +78,7 @@ Report reproducible problems through [Issues](https://github.com/auricom79/openf
 
 ## Development and credits
 
-See [BUILDING.md](BUILDING.md) for the corresponding source snapshot and Quartus build instructions. The released bitstream is unchanged from the working local test.4; only public packaging and identifying metadata were adjusted.
+See [BUILDING.md](BUILDING.md) for the corresponding source snapshot and Quartus build instructions. The released FPGA bitstream is identical to the test.5 image validated by the tester; the release includes its corresponding sources.
 
 - **blahm1d and Wolf Unit contributors** — original [Wolf Unit FPGA implementation](https://github.com/blahm1d/wolf-unit).
 - **Kevin Coleman** — TMS34010 core.

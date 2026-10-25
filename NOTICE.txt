@@ -10,8 +10,9 @@ Wolf Unit — blahm1d and contributors
   Baseline commit acf7fe7d08c838e36f8dd2cf1eae657454fa6b11
   Modified files are supplied in src/upstream/wolf-unit.
   The upstream README is retained in licenses/wolf-unit-upstream-README.md.
-  Pocket changes include memory arbitration/adaptation, area optimizations of
-  CPU and DCS logic, framebuffer publication, loader/reset integration and I/O.
+  Pocket changes include memory arbitration/adaptation, aligned RAM writes,
+  program caching, dense-graphics prefetch, area optimizations of CPU and DCS
+  logic, framebuffer publication, loader/reset integration and I/O.
   A generated combined Verilog file is also supplied with its preferred sources.
 
 TMS34010 — Copyright (c) 2026 Kevin Coleman, MIT
@@ -50,13 +51,19 @@ New files marked SPDX-License-Identifier: MIT
   See licenses/MIT-adapters.txt. These files do not relicense third-party code.
 
 Pocket integration and hardware testing: auricom79, with OpenAI Codex assistance.
-Public documentation and packaging prepared 22 October 2026. The FPGA bitstream
-is the unchanged test.4 build tested on 20 October 2026.
+The test.4/test.4.1 FPGA bitstream was tested on 20 October 2026.
+The new test.5 FPGA bitstream was separately built, reviewed and tested on
+Pocket; smoother gameplay and its loading display were confirmed by
+auricom79 on 25 October 2026. This is qualitative community validation.
 
-No game ROMs, extracted game audio/graphics or ROM-download service are supplied.
+No executable game ROMs, game ROM asset streams or ROM-download service are supplied.
 The cover artwork in docs/images/openice-cover.jpg was provided by auricom79
 for the project presentation. The Pocket menu image is a monochrome format
-conversion of that cover. Artwork and trademarks remain the property of their
+conversion of that cover. The loading-screen image in docs/images/openice-title.png
+is a rendered title-screen screenshot from the user's supplied game; the two
+openice_loading.hex copies encode that screenshot as a small grayscale FPGA
+bitmap. These images do not replace any of the game ROMs required to play.
+Artwork and trademarks remain the property of their
 respective holders and are not relicensed under the software GPL/MIT licenses.
 Game names identify compatibility; this is not an official Analogue, Midway or
 NHL product. See README.md and BUILDING.md for limitations and source details.

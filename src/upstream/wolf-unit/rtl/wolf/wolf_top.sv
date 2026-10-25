@@ -303,7 +303,11 @@ module wolf_top
     else if (cpu_ce)  mem_srt_r <= cpu_srt;
   end
 
-  yunit_mem_sameclock #(.AW(ADDR_WIDTH), .DW(DATA_WIDTH), .SW(FIELD_SIZE_WIDTH)) u_memcdc (
+  yunit_mem_sameclock #(.AW(ADDR_WIDTH), .DW(DATA_WIDTH), .SW(FIELD_SIZE_WIDTH)
+`ifdef POCKET
+    , .FAST_BACK_TO_BACK(1'b1)
+`endif
+  ) u_memcdc (
     .clk_cpu(clk), .ce_cpu(cpu_ce), .rst_cpu(core_rst_sys),
     .c_req(cpu_req), .c_we(cpu_we), .c_addr(cpu_addr), .c_size(cpu_size), .c_wdata(cpu_wdata),
     .c_ack(cpu_ack), .c_rdata(cpu_rdata),
@@ -683,6 +687,10 @@ module wolf_top
   yunit_sdram_arb #(
     .SD_AW(25), .GFXW_BASE(GFXW_BASE), .ROMW_BASE(ROMW_BASE),
     .VRAMW_BASE(VRAMW_BASE), .RAMW_BASE(RAMW_BASE), .GFX_BYTES(GFX_BYTES)
+`ifdef POCKET
+    // Cache program words without changing the CPU or video clock rates.
+    , .CGFX_CACHE_BITS(6)
+`endif
   ) u_arb (
     .clk(clk), .rst(sdram_por),                 // P0022: persistent SDRAM subsystem -> POR, not core rst
 `ifdef USE_DDR3_VRAM
@@ -732,7 +740,14 @@ module wolf_top
   wire [63:0] vg_ddram_din;  wire [7:0] vg_ddram_be; wire vg_ddram_busy;
   wire [63:0] vg_ddram_dout; wire vg_ddram_dready;
 
-  wolf_gfx_ddr_top #(.USE_STREAM_HINT(1'b1)) u_gfxddr (
+  wolf_gfx_ddr_top #(
+    .USE_STREAM_HINT(1'b1)
+`ifdef POCKET
+    // The Pocket PSRAM path drains every response in an aligned block;
+    // other hosts keep the donor's single-beat prefetch transaction shape.
+    , .STREAM_BURST_BEATS(4)
+`endif
+  ) u_gfxddr (
     .clk(clk), .rst(core_rst), .sdram_por(sdram_por),
     .src_req(src_req), .src_addr(src_addr), .src_active(src_active),
     .src_stream(src_stream),

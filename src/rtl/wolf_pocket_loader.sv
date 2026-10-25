@@ -5,7 +5,7 @@
 // throughout the toggle handshake, including arbitrarily long memory stalls.
 `default_nettype none
 module wolf_pocket_loader #(
-    parameter integer CHUNK_BYTES=1024,
+    parameter integer CHUNK_BYTES=4096,
     parameter integer PROGRAM_BYTES=1048576,
     parameter integer GRAPHICS_BYTES=16777216,
     parameter integer SOUND_BYTES=4194304
@@ -20,6 +20,7 @@ module wolf_pocket_loader #(
     input wire target_ack, target_done,
     input wire [2:0] target_error,
     output reg done=0, fault=0,
+    output reg [6:0] progress=0, progress_gray=0,
     output wire load_active, load_valid,
     output reg [1:0] load_index=0,
     output reg [24:0] load_addr=0,
@@ -28,11 +29,15 @@ module wolf_pocket_loader #(
 );
     localparam integer WORDS=CHUNK_BYTES/4;
     localparam integer AW=$clog2(WORDS);
+    localparam integer TOTAL_BYTES=PROGRAM_BYTES+GRAPHICS_BYTES+SOUND_BYTES;
     localparam [3:0] WAIT_START=0, ISSUE=1, ARM=2, RECEIVE=3,
-                     DRAIN=4, ADVANCE=5, FINISHED=6, FAILED=7;
+                     DRAIN=4, ADVANCE=5, FINISHED=6, FAILED=7, PROGRESS=8;
     reg [3:0] state=WAIT_START;
     reg [1:0] slot=0;
     reg [31:0] offset=0, received=0;
+    reg [31:0] progress_remainder=0;
+    reg final_chunk=0;
+    wire [6:0] next_progress=progress+7'd1;
     wire [31:0] slot_size=slot==0 ? PROGRAM_BYTES :
                                  slot==1 ? GRAPHICS_BYTES : SOUND_BYTES;
     (* ramstyle="M10K, no_rw_check" *) reg [31:0] buffer [0:WORDS-1];
@@ -54,6 +59,7 @@ module wolf_pocket_loader #(
             state<=WAIT_START; slot<=0; offset<=0; received<=0;
             done<=0; fault<=0; request_toggle<=0; prev_wr<=0;
             ack_meta<=0; ack_sync<=0;
+            progress<=0; progress_gray<=0; progress_remainder<=0; final_chunk<=0;
         end else begin
             case(state)
                 WAIT_START: if(start) state<=ISSUE;
@@ -72,11 +78,27 @@ module wolf_pocket_loader #(
                 end
                 DRAIN: if(ack_sync==request_toggle) state<=ADVANCE;
                 ADVANCE: begin
+                    // Count only chunks acknowledged after physical memory
+                    // writes have drained. Carry the fractional percentage
+                    // instead of inferring a hardware divider/multiplier.
+                    progress_remainder<=progress_remainder+CHUNK_BYTES*100;
+                    state<=PROGRESS;
                     if(offset+CHUNK_BYTES==slot_size) begin
                         offset<=0;
-                        if(slot==2) begin done<=1; state<=FINISHED; end
-                        else begin slot<=slot+1'b1; state<=ISSUE; end
-                    end else begin offset<=offset+CHUNK_BYTES; state<=ISSUE; end
+                        if(slot==2) final_chunk<=1;
+                        else slot<=slot+1'b1;
+                    end else offset<=offset+CHUNK_BYTES;
+                end
+                PROGRESS: begin
+                    if(progress_remainder>=TOTAL_BYTES) begin
+                        progress_remainder<=progress_remainder-TOTAL_BYTES;
+                        progress<=next_progress;
+                        // Registered adjacent Gray states permit coherent
+                        // observation from the slower display clock domain.
+                        progress_gray<=next_progress^(next_progress>>1);
+                    end else if(final_chunk) begin
+                        done<=1; state<=FINISHED;
+                    end else state<=ISSUE;
                 end
                 default: ;
             endcase

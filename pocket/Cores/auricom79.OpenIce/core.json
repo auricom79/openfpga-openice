@@ -9,8 +9,8 @@
       "description": "NHL Open Ice - experimental Pocket port.",
       "author": "auricom79",
       "url": "https://github.com/auricom79/openfpga-openice",
-      "version": "0.1.0-test.4.1",
-      "date_release": "2026-10-22"
+      "version": "0.1.0-test.5",
+      "date_release": "2026-10-25"
     },
     "framework": {
       "target_product": "Analogue Pocket",

@@ -719,15 +719,17 @@ module wolf_dma
   // Both consumers below capture only on an actual next-pixel advance.
   // The current-pixel probe is separate, so selecting o_r in unused cycles
   // only inserted the late clip decision ahead of this address/tag cone.
-  // Scaled advances already have an intervening walker/gap cycle. Register
-  // their pointer there; cache-tag selection then fits in the capture cycle.
-  // Only look-ahead consumes this register; current-pixel fetches remain live.
+  // Every write/clip advance has an intervening pixel or gap cycle.
+  // Register the selected next pointer there for both scaled and unscaled
+  // draws, so neither pointer addition precedes the cache-tag comparisons
+  // in the address-capture cycle. This reuses the existing look-ahead
+  // register and adds no cycle. Current-pixel probes remain live.
   logic [31:0] scaled_lookup_o_r;
   always_ff @(posedge clk) begin
     if (rst) scaled_lookup_o_r <= 32'd0;
-    else scaled_lookup_o_r <= sc_next_o_w;
+    else scaled_lookup_o_r <= scale_c ? sc_next_o_w : ns_next_o_w;
   end
-  wire [31:0] lookup_o_w = scale_c ? scaled_lookup_o_r : ns_next_o_w;
+  wire [31:0] lookup_o_w = scaled_lookup_o_r;
   wire [31:0] lookup_byte0_w = {3'b000, lookup_o_w[31:3]};
   wire [31:0] lookup_byte1_w = lookup_byte0_w + 32'd1;
   // Partition the full tag equality into independently kept byte groups.
@@ -1808,9 +1810,11 @@ module wolf_dma
     if (rst) begin
       sim_ix_age_r <= 3'd7;
     end else begin
-      if (sim_scaled_lookahead_capture_w && SHARED_SOURCE_LOOKUP &&
-          scaled_lookup_o_r !== sc_next_o_w)
-        $fatal(1, "Scaled look-ahead pipeline consumed an unstable pointer");
+      if (fsm_step_w && SHARED_SOURCE_LOOKUP &&
+          (((state == S_WR) && (state_n == S_PIX)) ||
+           ((state == S_PIX) && pix_remain && !in_clip && !clip_gap)) &&
+          scaled_lookup_o_r !== (scale_c ? sc_next_o_w : ns_next_o_w))
+        $fatal(1, "Look-ahead pipeline consumed an unstable next pointer");
       if (sim_scaled_lookahead_capture_w && (sim_ix_age_r < 3'd1))
         $fatal(1, "wolf_dma: scaled look-ahead captured before ix two-cycle gap");
 

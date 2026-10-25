@@ -5642,9 +5642,9 @@ module wolf_mem (
 					hval[j] = 1'b0;
 				end
 		end
-		if (region == R_RAM)
+		if (a_q[31:22] == 10'h004)
 			;
-		else if (region == R_PAL) begin
+		else if (a_q[31:19] == 13'h0031) begin
 			is_hwram = 1'b1;
 			hsel = 2'd1;
 			begin : sv2v_autoblock_2
@@ -5657,7 +5657,7 @@ module wolf_mem (
 					end
 			end
 		end
-		else if (region == R_CMOS) begin
+		else if (a_q[31:19] == 13'h0028) begin
 			is_hwram = 1'b1;
 			hsel = 2'd2;
 			begin : sv2v_autoblock_3
@@ -6583,6 +6583,7 @@ module wolf_dma (
 	wire [8:0] maskfull = (9'd1 << bpp_c) - 9'd1;
 	wire px_straddle = {1'b0, o_lo3} > straddle_limit_c;
 	reg [31:0] scaled_lookup_o_r;
+	wire [31:0] ns_next_o_w = o_r + bpp32;
 	wire [8:0] sc_fraction_sum_w = {1'b0, ix[7:0]} + {1'b0, xstep_c[7:0]};
 	reg [11:0] sc_step_ceil_r;
 	reg [11:0] sc_step_floor_r;
@@ -6592,9 +6593,8 @@ module wolf_dma (
 		if (rst)
 			scaled_lookup_o_r <= 32'd0;
 		else
-			scaled_lookup_o_r <= sc_next_o_w;
-	wire [31:0] ns_next_o_w = o_r + bpp32;
-	wire [31:0] lookup_o_w = (scale_c ? scaled_lookup_o_r : ns_next_o_w);
+			scaled_lookup_o_r <= (scale_c ? sc_next_o_w : ns_next_o_w);
+	wire [31:0] lookup_o_w = scaled_lookup_o_r;
 	wire [31:0] lookup_byte0_w = {3'b000, lookup_o_w[31:3]};
 	wire [31:0] lookup_byte1_w = lookup_byte0_w + 32'd1;
 	(* keep = "true" *) wire [3:0] lookup_cache0_equal_byte_w;
@@ -7526,12 +7526,12 @@ module wolf_dma (
 		if (rst)
 			sim_ix_age_r <= 3'd7;
 		else begin
-			if ((sim_scaled_lookahead_capture_w && SHARED_SOURCE_LOOKUP) && (scaled_lookup_o_r !== sc_next_o_w)) begin
-				$display("Fatal [%0t] src/upstream/wolf-unit/rtl/wolf/wolf_dma.sv:1813:9 - wolf_dma.<unnamed_block>.<unnamed_block>.<unnamed_block>\n msg: ", $time, "Scaled look-ahead pipeline consumed an unstable pointer");
+			if (((fsm_step_w && SHARED_SOURCE_LOOKUP) && (((state == 5'd17) && (state_n == 5'd14)) || ((((state == 5'd14) && pix_remain) && !in_clip) && !clip_gap))) && (scaled_lookup_o_r !== (scale_c ? sc_next_o_w : ns_next_o_w))) begin
+				$display("Fatal [%0t] src/upstream/wolf-unit/rtl/wolf/wolf_dma.sv:1817:9 - wolf_dma.<unnamed_block>.<unnamed_block>.<unnamed_block>\n msg: ", $time, "Look-ahead pipeline consumed an unstable next pointer");
 				$finish(1);
 			end
 			if (sim_scaled_lookahead_capture_w && (sim_ix_age_r < 3'd1)) begin
-				$display("Fatal [%0t] src/upstream/wolf-unit/rtl/wolf/wolf_dma.sv:1815:9 - wolf_dma.<unnamed_block>.<unnamed_block>.<unnamed_block>\n msg: ", $time, "wolf_dma: scaled look-ahead captured before ix two-cycle gap");
+				$display("Fatal [%0t] src/upstream/wolf-unit/rtl/wolf/wolf_dma.sv:1819:9 - wolf_dma.<unnamed_block>.<unnamed_block>.<unnamed_block>\n msg: ", $time, "wolf_dma: scaled look-ahead captured before ix two-cycle gap");
 				$finish(1);
 			end
 			if (sim_ix_write_w)
@@ -8152,6 +8152,7 @@ module ram_sdram (
 	reg _sv2v_0;
 	parameter signed [31:0] RAMW = 32'h00040000;
 	parameter signed [31:0] SD_AW = 25;
+	parameter [0:0] FAST_FULL_WRITES = 1'b1;
 	parameter [SD_AW - 1:0] RAM_BASE = 1'sb0;
 	input wire clk;
 	input wire rst;
@@ -8249,7 +8250,7 @@ module ram_sdram (
 						o1 <= 16'h0000;
 						o2 <= 16'h0000;
 						idx <= 3'd0;
-						st <= 2'd1;
+						st <= (((FAST_FULL_WRITES && we) && (boff == 4'd0)) && ((sz == 6'd16) || (sz == 6'd32)) ? 2'd2 : 2'd1);
 					end
 				end
 				2'd1:
@@ -9553,6 +9554,7 @@ module wolf_gfx_ddr_top (
 	reg _sv2v_0;
 	parameter [28:0] GFX_DDR_BASE = 29'h06800000;
 	parameter [0:0] USE_STREAM_HINT = 1'b0;
+	parameter integer STREAM_BURST_BEATS = 1;
 	parameter [0:0] DIRECT_PREFETCH = 1'b1;
 	input wire clk;
 	input wire rst;
@@ -9660,6 +9662,9 @@ module wolf_gfx_ddr_top (
 	reg [21:0] pf_target;
 	reg [2:0] pf_left;
 	reg [2:0] pf_goal;
+	reg [2:0] pf_burst_len;
+	reg [2:0] pf_burst_left;
+	reg [21:0] pf_burst_base;
 	reg src_line_valid;
 	reg [21:0] src_line_tag;
 	reg [63:0] src_line_data;
@@ -9801,6 +9806,8 @@ module wolf_gfx_ddr_top (
 	wire src_live_miss_w = (src_req && !src_hit) && !src_pf_hit;
 	wire cg_live_miss_w = cg_req && !cg_hit;
 	wire stream_prefetch_w = USE_STREAM_HINT && src_stream;
+	wire [2:0] pf_until_boundary_w = 3'd4 - {1'b0, pf_target[1:0]};
+	wire [2:0] pf_issue_len_w = ((STREAM_BURST_BEATS == 4) && stream_prefetch_w ? pf_until_boundary_w : 3'd1);
 	reg pf_pend_hit_w;
 	reg [1:0] pf_pend_slot_w;
 	reg [2:0] pf_valid_count_w;
@@ -9873,6 +9880,9 @@ module wolf_gfx_ddr_top (
 			pf_target <= 22'd0;
 			pf_left <= 3'd0;
 			pf_goal <= 3'd1;
+			pf_burst_len <= 3'd1;
+			pf_burst_left <= 3'd1;
+			pf_burst_base <= 22'd0;
 			begin : sv2v_autoblock_4
 				reg signed [31:0] p;
 				for (p = 0; p < PF_DEPTH; p = p + 1)
@@ -9897,6 +9907,10 @@ module wolf_gfx_ddr_top (
 			tst_wr_req <= 1'b0;
 			src_done <= 1'b0;
 			cg_done <= 1'b0;
+			if (o_done_pend && (ost == O_PWAIT)) begin
+				src_done <= 1'b1;
+				o_done_pend <= 1'b0;
+			end
 			case (ost)
 				O_IDLE:
 					if (wflush_req) begin
@@ -9915,11 +9929,17 @@ module wolf_gfx_ddr_top (
 							ost <= O_FRD;
 						end
 					end
-					else if (src_pf_served && pf_valid[src_pf_served_slot]) begin
+					else if ((src_pf_served && pf_valid[src_pf_served_slot]) && (!((STREAM_BURST_BEATS == 4) && stream_prefetch_w) || (src_pf_served_slot == 2'd3))) begin
 						src_line_data <= (DIRECT_PREFETCH ? pf_promote_data_w : pf_data[src_pf_served_slot]);
 						src_line_valid <= 1'b1;
 						src_line_tag <= (DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[src_pf_served_slot]);
-						if (src_line_valid && ((DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[src_pf_served_slot]) == (src_line_tag + 22'd1))) begin
+						if ((STREAM_BURST_BEATS == 4) && stream_prefetch_w) begin
+							pf_valid <= 1'sb0;
+							pf_target <= pf_promote_tag_w + 22'd1;
+							pf_left <= 3'd4;
+							pf_goal <= 3'd4;
+						end
+						else if (src_line_valid && ((DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[src_pf_served_slot]) == (src_line_tag + 22'd1))) begin
 							pf_valid[src_pf_served_slot] <= 1'b0;
 							pf_goal <= pf_next_goal_w;
 							pf_left <= pf_refill_after_consume_w;
@@ -9938,7 +9958,9 @@ module wolf_gfx_ddr_top (
 							src_line_data <= (DIRECT_PREFETCH ? pf_promote_data_w : pf_data[pf_pend_slot_w]);
 							src_line_valid <= 1'b1;
 							src_line_tag <= (DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[pf_pend_slot_w]);
-							if (src_line_valid && ((DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[pf_pend_slot_w]) == (src_line_tag + 22'd1))) begin
+							if ((STREAM_BURST_BEATS == 4) && stream_prefetch_w)
+								pf_valid[pf_pend_slot_w] <= 1'b0;
+							else if (src_line_valid && ((DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[pf_pend_slot_w]) == (src_line_tag + 22'd1))) begin
 								pf_valid[pf_pend_slot_w] <= 1'b0;
 								pf_goal <= pf_next_goal_w;
 								pf_left <= pf_refill_after_consume_w;
@@ -10030,26 +10052,39 @@ module wolf_gfx_ddr_top (
 					end
 					ost <= O_IDLE;
 				end
-				O_PISSUE:
+				O_PISSUE: begin
+					pf_burst_base <= pf_target;
+					pf_burst_len <= pf_issue_len_w;
+					pf_burst_left <= pf_issue_len_w;
 					if (((wflush_req || src_pend) || src_live_miss_w) || ((cg_pend || cg_live_miss_w) && cg_safe_w))
 						ost <= O_IDLE;
 					else begin
 						tst_rd_req <= 1'b1;
 						ost <= O_PWAIT;
 					end
+				end
 				O_PWAIT:
 					if (tst_rd_valid) begin
 						if (src_pend && (src_qaddr[24:3] == pf_target)) begin
 							src_line_data <= tst_rdata;
 							src_line_valid <= 1'b1;
 							src_line_tag <= pf_target;
-							pf_valid <= 1'sb0;
 							pf_target <= pf_target + 22'd1;
-							pf_left <= 3'd1;
-							pf_goal <= 3'd1;
 							o_is_src <= 1'b1;
 							o_done_pend <= 1'b1;
-							ost <= O_GAP;
+							if (pf_burst_len == 3'd1) begin
+								pf_valid <= 1'sb0;
+								pf_left <= 3'd1;
+								pf_goal <= 3'd1;
+								ost <= O_GAP;
+							end
+							else begin
+								if (pf_left != 3'd0)
+									pf_left <= pf_left - 3'd1;
+								pf_burst_left <= pf_burst_left - 3'd1;
+								if (pf_burst_left == 3'd1)
+									ost <= O_GAP;
+							end
 						end
 						else begin
 							pf_data[pf_target[1:0]] <= tst_rdata;
@@ -10058,7 +10093,9 @@ module wolf_gfx_ddr_top (
 							pf_target <= pf_target + 22'd1;
 							if (pf_left != 3'd0)
 								pf_left <= pf_left - 3'd1;
-							ost <= O_IDLE;
+							pf_burst_left <= pf_burst_left - 3'd1;
+							if (pf_burst_left == 3'd1)
+								ost <= O_IDLE;
 						end
 					end
 				default: ost <= O_IDLE;
@@ -10066,8 +10103,8 @@ module wolf_gfx_ddr_top (
 		end
 	wire fsel = (((ost == O_FRD) || (ost == O_FRDW)) || (ost == O_FWR)) || (ost == O_FWW);
 	wire psel = (ost == O_PISSUE) || (ost == O_PWAIT);
-	assign tst_addr = (fsel ? {4'd0, wl_beat} : (psel ? {4'd0, pf_target} : {4'd0, o_line}));
-	assign tst_burstcnt = 8'd1;
+	assign tst_addr = (fsel ? {4'd0, wl_beat} : (psel ? {4'd0, pf_burst_base} : {4'd0, o_line}));
+	assign tst_burstcnt = (psel ? {5'd0, pf_burst_len} : 8'd1);
 	assign tst_wdata = wl_data;
 	assign dl_idle = (((!wc_valid && (ost == O_IDLE)) && !tst_busy) && !tst_rd_req) && !tst_wr_req;
 	initial _sv2v_0 = 0;
@@ -14092,6 +14129,7 @@ module yunit_sdram_arb (
 	parameter [SD_AW - 1:0] ROMW_BASE = 25'h00c0000;
 	parameter [SD_AW - 1:0] VRAMW_BASE = 25'h00e0000;
 	parameter [SD_AW - 1:0] RAMW_BASE = 25'h0180000;
+	parameter signed [31:0] CGFX_CACHE_BITS = 0;
 	parameter [23:0] GFX_BYTES = 24'h180000;
 	input wire clk;
 	input wire rst;
@@ -14137,15 +14175,13 @@ module yunit_sdram_arb (
 	wire src_bsel = src_addr[0];
 	wire [SD_AW - 1:0] vsd_word = VRAMW_BASE + vsd_addr;
 	wire [SD_AW - 1:0] rsd_word = RAMW_BASE + rsd_addr;
-	reg cgfx_cache_valid;
-	reg [SD_AW - 1:0] cgfx_cache_word;
-	reg [15:0] cgfx_cache_data;
+	wire cgfx_cache_hit;
+	wire [7:0] cgfx_cache_byte;
+	wire cgfx_lookup_ready;
+	wire alias_cache_write;
 	reg cgfx_hit_pending;
 	reg [7:0] cgfx_hit_data;
-	wire cgfx_cache_hit = cgfx_cache_valid && (cgfx_cache_word == cgfx_word);
-	wire [7:0] cgfx_cache_byte = (cgfx_bsel ? cgfx_cache_data[15:8] : cgfx_cache_data[7:0]);
-	wire cgfx_miss_req = (cgfx_rd && !cgfx_cache_hit) && !cgfx_hit_pending;
-	wire alias_cache_write = (iol_wr && cgfx_cache_valid) && (iol_addr == cgfx_cache_word);
+	wire cgfx_miss_req = ((cgfx_rd && cgfx_lookup_ready) && !cgfx_cache_hit) && !cgfx_hit_pending;
 	localparam [2:0] G_NONE = 3'd0;
 	localparam [2:0] G_IOL = 3'd1;
 	localparam [2:0] G_VSD = 3'd2;
@@ -14216,19 +14252,68 @@ module yunit_sdram_arb (
 			cgfx_hit_pending <= 1'b1;
 			cgfx_hit_data <= cgfx_cache_byte;
 		end
-	always @(posedge clk)
-		if (rst) begin
-			cgfx_cache_valid <= 1'b0;
-			cgfx_cache_word <= 1'sb0;
-			cgfx_cache_data <= 16'h0000;
+	generate
+		if (CGFX_CACHE_BITS == 0) begin : g_cache_original
+			reg cgfx_cache_valid;
+			reg [SD_AW - 1:0] cgfx_cache_word;
+			reg [15:0] cgfx_cache_data;
+			assign cgfx_lookup_ready = 1'b1;
+			assign cgfx_cache_hit = cgfx_cache_valid && (cgfx_cache_word == cgfx_word);
+			assign cgfx_cache_byte = (cgfx_bsel ? cgfx_cache_data[15:8] : cgfx_cache_data[7:0]);
+			assign alias_cache_write = (iol_wr && cgfx_cache_valid) && (iol_addr == cgfx_cache_word);
+			always @(posedge clk)
+				if (rst) begin
+					cgfx_cache_valid <= 1'b0;
+					cgfx_cache_word <= 1'sb0;
+					cgfx_cache_data <= 16'h0000;
+				end
+				else if (alias_cache_write)
+					cgfx_cache_valid <= 1'b0;
+				else if (sd_ack && (gnt == G_CGFX)) begin
+					cgfx_cache_valid <= 1'b1;
+					cgfx_cache_word <= sd_addr;
+					cgfx_cache_data <= sd_dout;
+				end
 		end
-		else if (alias_cache_write)
-			cgfx_cache_valid <= 1'b0;
-		else if (sd_ack && (gnt == G_CGFX)) begin
-			cgfx_cache_valid <= 1'b1;
-			cgfx_cache_word <= sd_addr;
-			cgfx_cache_data <= sd_dout;
+		else begin : g_cache_table
+			localparam signed [31:0] LINES = 1 << CGFX_CACHE_BITS;
+			localparam signed [31:0] TAG_W = SD_AW - CGFX_CACHE_BITS;
+			(* ramstyle = "M10K, no_rw_check" *) reg [TAG_W + 15:0] line_ram [0:LINES - 1];
+			reg [LINES - 1:0] valid_bits;
+			reg [TAG_W + 15:0] lookup_line;
+			reg [SD_AW - 1:0] lookup_word;
+			reg lookup_present;
+			reg lookup_valid;
+			wire [CGFX_CACHE_BITS - 1:0] lookup_index = cgfx_word[CGFX_CACHE_BITS - 1:0];
+			wire [CGFX_CACHE_BITS - 1:0] fill_index = sd_addr[CGFX_CACHE_BITS - 1:0];
+			wire fill = sd_ack && (gnt == G_CGFX);
+			wire lookup_fill_collision = fill && (lookup_index == fill_index);
+			assign alias_cache_write = iol_wr;
+			assign cgfx_lookup_ready = (lookup_present && (lookup_word == cgfx_word)) && !iol_wr;
+			assign cgfx_cache_hit = (cgfx_lookup_ready && lookup_valid) && (lookup_line[TAG_W + 15:16] == cgfx_word[SD_AW - 1:CGFX_CACHE_BITS]);
+			assign cgfx_cache_byte = (cgfx_bsel ? lookup_line[15:8] : lookup_line[7:0]);
+			always @(posedge clk) begin
+				lookup_line <= line_ram[lookup_index];
+				if (fill && !rst)
+					line_ram[fill_index] <= {sd_addr[SD_AW - 1:CGFX_CACHE_BITS], sd_dout};
+				if (rst) begin
+					valid_bits <= 1'sb0;
+					lookup_present <= 1'b0;
+					lookup_valid <= 1'b0;
+					lookup_word <= 1'sb0;
+				end
+				else begin
+					lookup_word <= cgfx_word;
+					lookup_present <= !iol_wr && !lookup_fill_collision;
+					lookup_valid <= (valid_bits[lookup_index] && !iol_wr) && !lookup_fill_collision;
+					if (iol_wr)
+						valid_bits <= 1'sb0;
+					else if (fill)
+						valid_bits[fill_index] <= 1'b1;
+				end
+			end
 		end
+	endgenerate
 	reg cgfx_bsel_q;
 	reg src_bsel_q;
 	reg [SD_AW - 1:0] cgfx_word_q;
@@ -14705,6 +14790,7 @@ module yunit_mem_sameclock (
 	parameter AW = 32;
 	parameter DW = 32;
 	parameter SW = 6;
+	parameter [0:0] FAST_BACK_TO_BACK = 1'b0;
 	input wire clk_cpu;
 	input wire ce_cpu;
 	input wire rst_cpu;
@@ -14759,7 +14845,7 @@ module yunit_mem_sameclock (
 				2'd2:
 					if (ce_cpu !== 1'b0) begin
 						c_ack <= 1'b0;
-						scst <= 2'd3;
+						scst <= (FAST_BACK_TO_BACK ? 2'd0 : 2'd3);
 					end
 				2'd3:
 					if (ce_cpu !== 1'b0)
@@ -15115,7 +15201,8 @@ module wolf_top (
 	yunit_mem_sameclock #(
 		.AW(tms34010_pkg_ADDR_WIDTH),
 		.DW(tms34010_pkg_DATA_WIDTH),
-		.SW(tms34010_pkg_FIELD_SIZE_WIDTH)
+		.SW(tms34010_pkg_FIELD_SIZE_WIDTH),
+		.FAST_BACK_TO_BACK(1'b1)
 	) u_memcdc(
 		.clk_cpu(clk),
 		.ce_cpu(cpu_ce),
@@ -15506,7 +15593,8 @@ module wolf_top (
 		.ROMW_BASE(ROMW_BASE),
 		.VRAMW_BASE(VRAMW_BASE),
 		.RAMW_BASE(RAMW_BASE),
-		.GFX_BYTES(GFX_BYTES)
+		.GFX_BYTES(GFX_BYTES),
+		.CGFX_CACHE_BITS(6)
 	) u_arb(
 		.clk(clk),
 		.rst(sdram_por),
@@ -15566,7 +15654,10 @@ module wolf_top (
 	wire vg_ddram_busy;
 	wire [63:0] vg_ddram_dout;
 	wire vg_ddram_dready;
-	wolf_gfx_ddr_top #(.USE_STREAM_HINT(1'b1)) u_gfxddr(
+	wolf_gfx_ddr_top #(
+		.USE_STREAM_HINT(1'b1),
+		.STREAM_BURST_BEATS(4)
+	) u_gfxddr(
 		.clk(clk),
 		.rst(core_rst),
 		.sdram_por(sdram_por),
@@ -17323,6 +17414,8 @@ module core_top (
 	wire loader_done;
 	wire loader_fault;
 	wire engine_fault;
+	wire [6:0] loader_progress;
+	wire [6:0] loader_progress_gray;
 	wire [31:0] cmd_data;
 	wire target_read;
 	wire target_ack;
@@ -17354,6 +17447,8 @@ module core_top (
 			bridge_rd_data = cmd_data;
 		else if (bridge_addr == 32'h20000000)
 			bridge_rd_data = {29'd0, ef_sync, loader_fault, loader_done};
+		else if (bridge_addr == 32'h20000004)
+			bridge_rd_data = {25'd0, loader_progress};
 	end
 	core_bridge_cmd commands(
 		.clk(clk_74a),
@@ -17443,6 +17538,8 @@ module core_top (
 		.target_error(target_error),
 		.done(loader_done),
 		.fault(loader_fault),
+		.progress(loader_progress),
+		.progress_gray(loader_progress_gray),
 		.load_active(load_active),
 		.load_valid(load_valid),
 		.load_index(load_index),
@@ -17581,15 +17678,72 @@ module core_top (
 	assign video_rgb_clock = clk_pixel;
 	assign video_rgb_clock_90 = clk_pixel_90;
 	assign video_skip = 0;
+	(* async_reg = "true" *) reg [6:0] progress_meta = 0;
+	(* async_reg = "true" *) reg [6:0] progress_sync = 0;
+	reg game_ready = 0;
+	reg display_fault = 0;
+	(* async_reg = "true" *) reg ready_pixel_meta = 0;
+	(* async_reg = "true" *) reg ready_pixel_sync = 0;
+	(* async_reg = "true" *) reg fault_pixel_meta = 0;
+	(* async_reg = "true" *) reg fault_pixel_sync = 0;
+	always @(posedge clk_sys) game_ready <= ((!por_mem[2] && !game_reset) && !load_active) && !engine_fault;
+	always @(posedge clk_74a) display_fault <= !por_bridge[2] && (loader_fault || ef_sync);
+	wire [6:0] progress_pixel;
+	genvar _gv_progress_bit_1;
+	generate
+		for (_gv_progress_bit_1 = 0; _gv_progress_bit_1 < 7; _gv_progress_bit_1 = _gv_progress_bit_1 + 1) begin : decode_progress
+			localparam progress_bit = _gv_progress_bit_1;
+			assign progress_pixel[progress_bit] = ^(progress_sync >> progress_bit);
+		end
+	endgenerate
+	reg show_loading = 1;
+	reg prev_game_vs = 0;
+	always @(posedge clk_pixel) begin
+		progress_meta <= loader_progress_gray;
+		progress_sync <= progress_meta;
+		ready_pixel_meta <= game_ready;
+		ready_pixel_sync <= ready_pixel_meta;
+		fault_pixel_meta <= display_fault;
+		fault_pixel_sync <= fault_pixel_meta;
+		prev_game_vs <= vs;
+		if (!ready_pixel_sync || fault_pixel_sync)
+			show_loading <= 1;
+		else if (vs && !prev_game_vs)
+			show_loading <= 0;
+		if (por_pixel[2]) begin
+			progress_meta <= 0;
+			progress_sync <= 0;
+			ready_pixel_meta <= 0;
+			ready_pixel_sync <= 0;
+			fault_pixel_meta <= 0;
+			fault_pixel_sync <= 0;
+			show_loading <= 1;
+			prev_game_vs <= 0;
+		end
+	end
+	wire [23:0] loading_rgb;
+	wire loading_hs;
+	wire loading_vs;
+	wire loading_de;
+	wolf_pocket_loading loading_screen(
+		.clk_pixel(clk_pixel),
+		.reset(por_pixel[2]),
+		.percent(progress_pixel),
+		.fault(fault_pixel_sync),
+		.rgb(loading_rgb),
+		.hs(loading_hs),
+		.vs(loading_vs),
+		.de(loading_de)
+	);
 	wolf_pocket_video video(
 		.clk_pixel(clk_pixel),
 		.reset(por_pixel[2]),
-		.r(r),
-		.g(g),
-		.b(b),
-		.hs(hs),
-		.vs(vs),
-		.de(de),
+		.r((show_loading ? loading_rgb[23:16] : r)),
+		.g((show_loading ? loading_rgb[15:8] : g)),
+		.b((show_loading ? loading_rgb[7:0] : b)),
+		.hs((show_loading ? loading_hs : hs)),
+		.vs((show_loading ? loading_vs : vs)),
+		.de((show_loading ? loading_de : de)),
 		.rgb(video_rgb),
 		.apf_hs(video_hs),
 		.apf_vs(video_vs),
@@ -17777,6 +17931,8 @@ module wolf_pocket_loader (
 	target_error,
 	done,
 	fault,
+	progress,
+	progress_gray,
 	load_active,
 	load_valid,
 	load_index,
@@ -17785,7 +17941,7 @@ module wolf_pocket_loader (
 	load_ready,
 	writes_idle
 );
-	parameter integer CHUNK_BYTES = 1024;
+	parameter integer CHUNK_BYTES = 4096;
 	parameter integer PROGRAM_BYTES = 1048576;
 	parameter integer GRAPHICS_BYTES = 16777216;
 	parameter integer SOUND_BYTES = 4194304;
@@ -17807,6 +17963,8 @@ module wolf_pocket_loader (
 	input wire [2:0] target_error;
 	output reg done = 0;
 	output reg fault = 0;
+	output reg [6:0] progress = 0;
+	output reg [6:0] progress_gray = 0;
 	output wire load_active;
 	output wire load_valid;
 	output reg [1:0] load_index = 0;
@@ -17816,6 +17974,7 @@ module wolf_pocket_loader (
 	input wire writes_idle;
 	localparam integer WORDS = CHUNK_BYTES / 4;
 	localparam integer AW = $clog2(WORDS);
+	localparam integer TOTAL_BYTES = (PROGRAM_BYTES + GRAPHICS_BYTES) + SOUND_BYTES;
 	localparam [3:0] WAIT_START = 0;
 	localparam [3:0] ISSUE = 1;
 	localparam [3:0] ARM = 2;
@@ -17824,10 +17983,14 @@ module wolf_pocket_loader (
 	localparam [3:0] ADVANCE = 5;
 	localparam [3:0] FINISHED = 6;
 	localparam [3:0] FAILED = 7;
+	localparam [3:0] PROGRESS = 8;
 	reg [3:0] state = WAIT_START;
 	reg [1:0] slot = 0;
 	reg [31:0] offset = 0;
 	reg [31:0] received = 0;
+	reg [31:0] progress_remainder = 0;
+	reg final_chunk = 0;
+	wire [6:0] next_progress = progress + 7'd1;
 	wire [31:0] slot_size = (slot == 0 ? PROGRAM_BYTES : (slot == 1 ? GRAPHICS_BYTES : SOUND_BYTES));
 	(* ramstyle = "M10K, no_rw_check" *) reg [31:0] buffer [0:WORDS - 1];
 	reg prev_wr = 0;
@@ -17856,6 +18019,10 @@ module wolf_pocket_loader (
 			prev_wr <= 0;
 			ack_meta <= 0;
 			ack_sync <= 0;
+			progress <= 0;
+			progress_gray <= 0;
+			progress_remainder <= 0;
+			final_chunk <= 0;
 		end
 		else begin
 			case (state)
@@ -17884,22 +18051,31 @@ module wolf_pocket_loader (
 				DRAIN:
 					if (ack_sync == request_toggle)
 						state <= ADVANCE;
-				ADVANCE:
+				ADVANCE: begin
+					progress_remainder <= progress_remainder + (CHUNK_BYTES * 100);
+					state <= PROGRESS;
 					if ((offset + CHUNK_BYTES) == slot_size) begin
 						offset <= 0;
-						if (slot == 2) begin
-							done <= 1;
-							state <= FINISHED;
-						end
-						else begin
+						if (slot == 2)
+							final_chunk <= 1;
+						else
 							slot <= slot + 1'b1;
-							state <= ISSUE;
-						end
 					end
-					else begin
+					else
 						offset <= offset + CHUNK_BYTES;
-						state <= ISSUE;
+				end
+				PROGRESS:
+					if (progress_remainder >= TOTAL_BYTES) begin
+						progress_remainder <= progress_remainder - TOTAL_BYTES;
+						progress <= next_progress;
+						progress_gray <= next_progress ^ (next_progress >> 1);
 					end
+					else if (final_chunk) begin
+						done <= 1;
+						state <= FINISHED;
+					end
+					else
+						state <= ISSUE;
 				default:
 					;
 			endcase
@@ -17988,7 +18164,7 @@ module wolf_pocket_loader (
 			endcase
 	end
 	initial if (((((CHUNK_BYTES < 8) || ((CHUNK_BYTES & (CHUNK_BYTES - 1)) != 0)) || ((PROGRAM_BYTES % CHUNK_BYTES) != 0)) || ((GRAPHICS_BYTES % CHUNK_BYTES) != 0)) || ((SOUND_BYTES % CHUNK_BYTES) != 0))
-		$display("Error [%0t] src/rtl/wolf_pocket_loader.sv:137:13 - wolf_pocket_loader.<unnamed_block>.<unnamed_block>\n msg: ", $time, "Chunk must be a power of two >=8 dividing all three ROM sizes");
+		$display("Error [%0t] src/rtl/wolf_pocket_loader.sv:159:13 - wolf_pocket_loader.<unnamed_block>.<unnamed_block>\n msg: ", $time, "Chunk must be a power of two >=8 dividing all three ROM sizes");
 endmodule
 `default_nettype wire
 module wolf_pocket_memory (
@@ -19125,3 +19301,154 @@ module dcs_ce_ram (
 		.eccstatus()
 	);
 endmodule
+`default_nettype none
+module wolf_pocket_loading (
+	clk_pixel,
+	reset,
+	percent,
+	fault,
+	rgb,
+	hs,
+	vs,
+	de
+);
+	parameter ART_FILE = "core/openice_loading.hex";
+	input wire clk_pixel;
+	input wire reset;
+	input wire [6:0] percent;
+	input wire fault;
+	output reg [23:0] rgb = 0;
+	output reg hs = 0;
+	output reg vs = 0;
+	output reg de = 0;
+	localparam [8:0] H_ACTIVE = 400;
+	localparam [8:0] H_TOTAL = 506;
+	localparam [8:0] V_ACTIVE = 254;
+	localparam [8:0] V_TOTAL = 289;
+	reg [8:0] x = 0;
+	reg [8:0] y = 0;
+	reg [6:0] shown_percent = 0;
+	reg shown_fault = 0;
+	always @(posedge clk_pixel)
+		if (reset) begin
+			x <= 0;
+			y <= 0;
+			shown_percent <= 0;
+			shown_fault <= 0;
+		end
+		else begin
+			if (x == (H_TOTAL - 9'd1)) begin
+				x <= 0;
+				if (y == (V_TOTAL - 9'd1))
+					y <= 0;
+				else
+					y <= y + 1'b1;
+			end
+			else
+				x <= x + 1'b1;
+			if ((x == 0) && (y == 0)) begin
+				shown_percent <= (percent > 100 ? 7'd100 : percent);
+				shown_fault <= fault;
+			end
+		end
+	(* ramstyle = "M10K" *) reg [4:0] artwork [0:20519];
+	initial $readmemh(ART_FILE, artwork);
+	wire in_art = ((x >= 20) && (x < 380)) && (y < 228);
+	function automatic [7:0] sv2v_cast_8;
+		input reg [7:0] inp;
+		sv2v_cast_8 = inp;
+	endfunction
+	wire [7:0] art_x = sv2v_cast_8((x - 9'd20) >> 1);
+	wire [6:0] art_y = y[7:1];
+	function automatic [14:0] sv2v_cast_15;
+		input reg [14:0] inp;
+		sv2v_cast_15 = inp;
+	endfunction
+	wire [14:0] art_addr = (sv2v_cast_15(art_y) * 15'd180) + {7'd0, art_x};
+	reg [4:0] art_q = 0;
+	always @(posedge clk_pixel) art_q <= artwork[(in_art ? art_addr : 15'd0)];
+	wire [7:0] gray = {art_q, art_q[4:2]};
+	function automatic [34:0] glyph;
+		input [7:0] letter;
+		case (letter)
+			"0": glyph = 35'b01110100011001110101110011000101110;
+			"1": glyph = 35'b00100011000010000100001000010001110;
+			"2": glyph = 35'b01110100010000100010001000100011111;
+			"3": glyph = 35'b11110000010000101110000010000111110;
+			"4": glyph = 35'b00010001100101010010111110001000010;
+			"5": glyph = 35'b11111100001000011110000010000111110;
+			"6": glyph = 35'b01110100001000011110100011000101110;
+			"7": glyph = 35'b11111000010001000100010000100001000;
+			"8": glyph = 35'b01110100011000101110100011000101110;
+			"9": glyph = 35'b01110100011000101111000010000101110;
+			"A": glyph = 35'b01110100011000111111100011000110001;
+			"D": glyph = 35'b11110100011000110001100011000111110;
+			"E": glyph = 35'b11111100001000011110100001000011111;
+			"G": glyph = 35'b01110100011000010111100011000101110;
+			"I": glyph = 35'b01110001000010000100001000010001110;
+			"L": glyph = 35'b10000100001000010000100001000011111;
+			"N": glyph = 35'b10001110011100110101100111001110001;
+			"O": glyph = 35'b01110100011000110001100011000101110;
+			"R": glyph = 35'b11110100011000111110101001001010001;
+			"%": glyph = 35'b11001110100001000100010000101110011;
+			default: glyph = 35'd0;
+		endcase
+	endfunction
+	function automatic [4:0] font_row;
+		input [7:0] letter;
+		input [2:0] row;
+		reg [34:0] bits;
+		begin
+			bits = glyph(letter);
+			font_row = bits[34 - (5 * row)-:5];
+		end
+	endfunction
+	wire [6:0] tens = shown_percent / 7'd10;
+	wire [6:0] units = shown_percent % 7'd10;
+	wire [7:0] hundreds_char = (shown_percent == 100 ? "1" : " ");
+	wire [7:0] tens_char = (shown_percent == 100 ? "0" : (shown_percent >= 10 ? 8'd48 + {1'b0, tens} : " "));
+	wire [7:0] units_char = 8'd48 + {1'b0, units};
+	function automatic [2:0] sv2v_cast_3;
+		input reg [2:0] inp;
+		sv2v_cast_3 = inp;
+	endfunction
+	wire [2:0] text_y = sv2v_cast_3((y - 9'd230) >> 1);
+	wire [71:0] text_row = (shown_fault ? {6'd0, font_row("L", text_y), 1'b0, font_row("O", text_y), 1'b0, font_row("A", text_y), 1'b0, font_row("D", text_y), 7'h00, font_row("E", text_y), 1'b0, font_row("R", text_y), 1'b0, font_row("R", text_y), 1'b0, font_row("O", text_y), 1'b0, font_row("R", text_y), 7'h00} : {font_row("L", text_y), 1'b0, font_row("O", text_y), 1'b0, font_row("A", text_y), 1'b0, font_row("D", text_y), 1'b0, font_row("I", text_y), 1'b0, font_row("N", text_y), 1'b0, font_row("G", text_y), 7'h00, font_row(hundreds_char, text_y), 1'b0, font_row(tens_char, text_y), 1'b0, font_row(units_char, text_y), 1'b0, font_row("%", text_y), 1'b0});
+	function automatic [6:0] sv2v_cast_7;
+		input reg [6:0] inp;
+		sv2v_cast_7 = inp;
+	endfunction
+	wire [6:0] text_x = sv2v_cast_7((x - 9'd128) >> 1);
+	wire text_pixel = ((((x >= 128) && (x < 272)) && (y >= 230)) && (y < 244)) && text_row[71 - text_x];
+	wire bar_border = ((((x >= 48) && (x <= 351)) && (y >= 246)) && (y <= 253)) && ((((x == 48) || (x == 351)) || (y == 246)) || (y == 253));
+	wire [8:0] filled_pixels = {2'd0, shown_percent} + ({2'd0, shown_percent} << 1);
+	wire bar_fill = (((x >= 50) && (x < (50 + filled_pixels))) && (y >= 248)) && (y <= 251);
+	reg art_valid_q = 0;
+	reg hs_q = 0;
+	reg vs_q = 0;
+	reg de_q = 0;
+	reg [23:0] overlay_q = 0;
+	always @(posedge clk_pixel) begin
+		art_valid_q <= in_art;
+		hs_q <= (x >= 405) && (x < 448);
+		vs_q <= (y >= 269) && (y < 272);
+		de_q <= (x < H_ACTIVE) && (y < V_ACTIVE);
+		overlay_q <= (bar_border ? 24'h687480 : (bar_fill ? (shown_fault ? 24'hc83838 : 24'h40c8e8) : (text_pixel ? (shown_fault ? 24'hff7777 : 24'hf0f4f8) : 24'h000000)));
+		rgb <= (de_q ? (art_valid_q ? {gray, gray, gray} : overlay_q) : 24'd0);
+		hs <= hs_q;
+		vs <= vs_q;
+		de <= de_q;
+		if (reset) begin
+			art_valid_q <= 0;
+			hs_q <= 0;
+			vs_q <= 0;
+			de_q <= 0;
+			overlay_q <= 0;
+			rgb <= 0;
+			hs <= 0;
+			vs <= 0;
+			de <= 0;
+		end
+	end
+endmodule
+`default_nettype wire

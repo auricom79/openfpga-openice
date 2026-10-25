@@ -289,6 +289,7 @@ always @(posedge clk_74a or negedge pll_locked)
 always @(posedge clk_pixel or negedge pll_locked)
     if(!pll_locked) por_pixel<=7; else por_pixel<={por_pixel[1:0],1'b0};
 wire reset_n,allcomplete,loader_done,loader_fault,engine_fault;
+wire [6:0] loader_progress,loader_progress_gray;
 wire [31:0] cmd_data;
 wire target_read,target_ack,target_done;
 wire [2:0] target_error;
@@ -306,6 +307,8 @@ always @* begin
     if(bridge_addr[31:24]==8'hF8) bridge_rd_data=cmd_data;
     else if(bridge_addr==32'h20000000)
         bridge_rd_data={29'd0,ef_sync,loader_fault,loader_done};
+    else if(bridge_addr==32'h20000004)
+        bridge_rd_data={25'd0,loader_progress};
 end
 // APF asks 0082 even before opening a deferred slot. Acknowledge readiness;
 // deferload in data.json keeps payload transfer under the chunk loader control.
@@ -346,6 +349,7 @@ wolf_pocket_loader loader(
     .target_read(target_read),.target_id(target_id),.target_offset(target_offset),
     .target_address(target_address),.target_length(target_length),.target_ack(target_ack),
     .target_done(target_done),.target_error(target_error),.done(loader_done),.fault(loader_fault),
+    .progress(loader_progress),.progress_gray(loader_progress_gray),
     .load_active(load_active),.load_valid(load_valid),.load_index(load_index),.load_addr(load_addr),
     .load_data(load_data),.load_ready(load_ready),.writes_idle(writes_idle)
 );
@@ -390,8 +394,49 @@ wolf_pocket_psram psram_backend(
 assign video_rgb_clock=clk_pixel;
 assign video_rgb_clock_90=clk_pixel_90;
 assign video_skip=0;
+// Keep a complete raster visible while the game is held in reset. The
+// percentage originates from physically drained chunks in the bridge domain.
+(* async_reg="true" *) reg [6:0] progress_meta=0,progress_sync=0;
+reg game_ready=0,display_fault=0;
+(* async_reg="true" *) reg ready_pixel_meta=0,ready_pixel_sync=0;
+(* async_reg="true" *) reg fault_pixel_meta=0,fault_pixel_sync=0;
+always @(posedge clk_sys)
+    game_ready<=!por_mem[2] && !game_reset && !load_active && !engine_fault;
+always @(posedge clk_74a)
+    display_fault<=!por_bridge[2] && (loader_fault || ef_sync);
+wire [6:0] progress_pixel;
+genvar progress_bit;
+generate for(progress_bit=0;progress_bit<7;progress_bit=progress_bit+1) begin: decode_progress
+    assign progress_pixel[progress_bit]=^(progress_sync>>progress_bit);
+end endgenerate
+reg show_loading=1,prev_game_vs=0;
+always @(posedge clk_pixel) begin
+    progress_meta<=loader_progress_gray; progress_sync<=progress_meta;
+    ready_pixel_meta<=game_ready; ready_pixel_sync<=ready_pixel_meta;
+    fault_pixel_meta<=display_fault; fault_pixel_sync<=fault_pixel_meta;
+    prev_game_vs<=vs;
+    if(!ready_pixel_sync || fault_pixel_sync) show_loading<=1;
+    // Change source at the next game vertical sync, never midway through an
+    // active game line. This does not hold up the CPU or change its timing.
+    else if(vs && !prev_game_vs) show_loading<=0;
+    if(por_pixel[2]) begin
+        progress_meta<=0; progress_sync<=0;
+        ready_pixel_meta<=0; ready_pixel_sync<=0;
+        fault_pixel_meta<=0; fault_pixel_sync<=0;
+        show_loading<=1; prev_game_vs<=0;
+    end
+end
+wire [23:0] loading_rgb;
+wire loading_hs,loading_vs,loading_de;
+wolf_pocket_loading loading_screen(.clk_pixel(clk_pixel),.reset(por_pixel[2]),
+    .percent(progress_pixel),.fault(fault_pixel_sync),.rgb(loading_rgb),
+    .hs(loading_hs),.vs(loading_vs),.de(loading_de));
 wolf_pocket_video video(.clk_pixel(clk_pixel),.reset(por_pixel[2]),
-    .r(r),.g(g),.b(b),.hs(hs),.vs(vs),.de(de),.rgb(video_rgb),
+    .r(show_loading ? loading_rgb[23:16] : r),
+    .g(show_loading ? loading_rgb[15:8] : g),
+    .b(show_loading ? loading_rgb[7:0] : b),
+    .hs(show_loading ? loading_hs : hs),.vs(show_loading ? loading_vs : vs),
+    .de(show_loading ? loading_de : de),.rgb(video_rgb),
     .apf_hs(video_hs),.apf_vs(video_vs),.apf_de(video_de));
 wolf_pocket_audio sound(.clk_bridge(clk_74a),.reset_bridge(por_bridge[2]),
     .clk_mem(clk_sys),.reset_mem(por_mem[2]),

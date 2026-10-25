@@ -202,6 +202,22 @@ foreach {source dest} {
 # Deliberately leave loader RAM dual-clock ports, PLL lock/reset recovery,
 # clk_pixel-as-data/pixel_prev and sys->pixel video under ordinary analysis.
 
+# Loading display: independent status levels enter two-flop synchronizers.
+# Only the first stages are exempt; their second stages retain normal timing.
+foreach {source dest} {
+    {ic|game_ready} {ic|ready_pixel_meta}
+    {ic|display_fault} {ic|fault_pixel_meta}
+} {
+    set_false_path -from [tr_regs display_source $source] -to [tr_regs display_meta $dest]
+}
+# Progress is registered Gray code and advances by exactly one per bridge
+# cycle. Bound all first-stage paths below the 13.468 ns source period so
+# successive transitions cannot overlap at the destination. No bus-wide cut.
+set display_progress_source [tr_regs progress_gray {ic|loader|progress_gray[*] ic|loader|progress_gray[6]~DUPLICATE}]
+set display_progress_capture [tr_regs progress_meta {ic|progress_meta[*]}]
+set_max_delay -from $display_progress_source -to $display_progress_capture 10.000
+set_min_delay -from $display_progress_source -to $display_progress_capture 0.000
+
 # ---- TMS CPU CE4, exact audited scalar/fabric registers ----
 # TMS CPU enable contract, Open Ice /4 only. Requires IO_CPU_CE=1 RTL.
 # Source audit: ce-register-audit.json; no IO/RAM/asynchronous launch nodes.

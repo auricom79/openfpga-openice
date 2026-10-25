@@ -17,6 +17,8 @@ def main():
         assert hashlib.sha256((ROOT / 'src' / name).read_bytes()).hexdigest() == expected, name
     assert hashlib.sha256((ROOT / 'quartus/core/wolf_combined.v').read_bytes()).hexdigest() == manifest['generated_verilog']['public_sha256']
     assert hashlib.sha256((ROOT / 'quartus/core/core_constraints.sdc').read_bytes()).hexdigest() == manifest['constraints']['effective_quartus_sha256']
+    for name, expected in manifest.get('compiled_project_sha256', {}).items():
+        assert hashlib.sha256((ROOT / 'quartus' / name).read_bytes()).hexdigest() == expected, name
     for path in (ROOT / 'quartus').rglob('*'):
         if path.is_file():
             raw = path.read_bytes()

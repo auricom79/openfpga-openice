@@ -747,6 +747,9 @@ module wolf_mem
   // window is FILLED changes (combinational -> clocked). Reads: 3 wait cycles;
   // writes: 3-4. The req/ack handshake absorbs the latency. VRAM is separate
   // (USE_HW_VRAM). Access distribution measured in tb_yunit_frame (MEASURE_ACCESS).
+  // Decode these physical RAM selects directly from the latched bit address.
+  // Routing them through the encoded region adds encode/decode logic before
+  // the BRAM bank address. Keep all index/default/bounds equations unchanged.
   logic is_hwram;                     // region uses this engine (RAM/PAL/CMOS)
   logic [1:0]  hsel;                  // 0=ram 1=pal 2=cmos (routes ports/q)
   logic [17:0] hidx [0:2];            // per-window-word array index (region-relative/paged)
@@ -755,7 +758,7 @@ module wolf_mem
   always_comb begin
     is_hwram = 1'b0; hsel = 2'd0; hr = 28'd0;
     for (int j=0;j<3;j++) begin hidx[j]=18'd0; hval[j]=1'b0; end
-    if (region==R_RAM) begin
+    if (a_q[31:22] == 10'h004) begin
 `ifndef USE_SDRAM_RAM
       is_hwram=1'b1; hsel=2'd0;
       for (int j=0;j<3;j++) begin
@@ -765,13 +768,13 @@ module wolf_mem
 `endif
       // USE_SDRAM_RAM: R_RAM diverts to ram_sdram (is_sdram_ram) BEFORE the is_hwram engine,
       // so is_hwram stays 0 here (default) and the BRAM path is bypassed for main RAM.
-    end else if (region==R_PAL) begin
+    end else if (a_q[31:19] == 13'h031) begin
       is_hwram=1'b1; hsel=2'd1;
       for (int j=0;j<3;j++) begin
         hr = (widx + j[27:0]) - WB_PAL;
         hidx[j]=hr[17:0]; hval[j]=(hr < PALW);
       end
-    end else if (region==R_CMOS) begin
+    end else if (a_q[31:19] == 13'h028) begin
       is_hwram=1'b1; hsel=2'd2;
       for (int j=0;j<3;j++) begin
         hr = (widx + j[27:0]) - WB_CMOS;

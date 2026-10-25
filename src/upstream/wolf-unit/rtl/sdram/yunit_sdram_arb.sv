@@ -18,6 +18,7 @@ module yunit_sdram_arb #(
   parameter [SD_AW-1:0] ROMW_BASE  = 25'h0C0000,   // program ROM @ 0xC0000 words (=0x180000 B)
   parameter [SD_AW-1:0] VRAMW_BASE = 25'h0E0000,   // VRAM        @ 0xE0000 words
   parameter [SD_AW-1:0] RAMW_BASE  = 25'h180000,   // main RAM    @ 0x180000 words (after VRAM)
+  parameter int CGFX_CACHE_BITS = 0, //0: original single-word cache; >0: synchronous table
   parameter [23:0]      GFX_BYTES  = 24'h180000    // gfx region size in bytes (ROM follows)
 )(
   input  logic         clk,
@@ -82,22 +83,14 @@ module yunit_sdram_arb #(
   // The CPU external interface is byte-wide, while SDRAM is 16 bits. Wolf's
   // field engine requests consecutive bytes, so without this cache the low
   // and high byte of one word each launch an identical physical SDRAM read.
-  logic             cgfx_cache_valid;
-  logic [SD_AW-1:0] cgfx_cache_word;
-  logic [15:0]      cgfx_cache_data;
+  wire              cgfx_cache_hit;
+  wire [7:0]        cgfx_cache_byte;
+  wire              cgfx_lookup_ready;
+  wire              alias_cache_write;
   logic             cgfx_hit_pending;
   logic [7:0]       cgfx_hit_data;
-  wire              cgfx_cache_hit = cgfx_cache_valid && (cgfx_cache_word == cgfx_word);
-  wire [7:0]        cgfx_cache_byte = cgfx_bsel ? cgfx_cache_data[15:8]
-                                                : cgfx_cache_data[7:0];
-  wire              cgfx_miss_req = cgfx_rd && !cgfx_cache_hit && !cgfx_hit_pending;
-  // In the production maps, VRAM/RAM occupy regions above GFX/program ROM and
-  // cannot alias this cache. IOL is the sole writer to the cached regions; the
-  // CPU/video are held in reset while it is active, but compare its tag anyway.
-  // Keeping VRAM's deep autoerase address path out of hit capture is also vital
-  // for the 80 MHz requester-response timing boundary.
-  wire              alias_cache_write = iol_wr && cgfx_cache_valid &&
-                                                 (iol_addr == cgfx_cache_word);
+  wire              cgfx_miss_req = cgfx_rd && cgfx_lookup_ready &&
+                                    !cgfx_cache_hit && !cgfx_hit_pending;
 
   // grant-held arbiter with inter-command bubble (same contract vram_sdram_top proved).
   // priority: boot IOL (download/unpack) > VRAM (real-time scanout) > CPU gfx/ROM > main RAM
@@ -164,21 +157,70 @@ module yunit_sdram_arb #(
     end
   end
 
-  // Fill only from a completed physical CPU read. An aliasing physical write
-  // drops the cache at command issue; unrelated VRAM/RAM/src traffic preserves it.
-  always_ff @(posedge clk) begin
-    if (rst) begin
-      cgfx_cache_valid <= 1'b0;
-      cgfx_cache_word  <= '0;
-      cgfx_cache_data  <= 16'h0000;
-    end else if (alias_cache_write) begin
-      cgfx_cache_valid <= 1'b0;
-    end else if (sd_ack && (gnt == G_CGFX)) begin
-      cgfx_cache_valid <= 1'b1;
-      cgfx_cache_word  <= sd_addr;
-      cgfx_cache_data  <= sd_dout;
+  generate if (CGFX_CACHE_BITS == 0) begin : g_cache_original
+    // Exact previous implementation, retained as the parameter0 reference.
+    logic cgfx_cache_valid;
+    logic [SD_AW-1:0] cgfx_cache_word;
+    logic [15:0] cgfx_cache_data;
+    assign cgfx_lookup_ready = 1'b1;
+    assign cgfx_cache_hit = cgfx_cache_valid && (cgfx_cache_word == cgfx_word);
+    assign cgfx_cache_byte = cgfx_bsel ? cgfx_cache_data[15:8] : cgfx_cache_data[7:0];
+    assign alias_cache_write = iol_wr && cgfx_cache_valid && (iol_addr == cgfx_cache_word);
+    always_ff @(posedge clk) begin
+      if (rst) begin
+        cgfx_cache_valid <= 1'b0;
+        cgfx_cache_word <= '0;
+        cgfx_cache_data <= 16'h0000;
+      end else if (alias_cache_write) begin
+        cgfx_cache_valid <= 1'b0;
+      end else if (sd_ack && (gnt == G_CGFX)) begin
+        cgfx_cache_valid <= 1'b1;
+        cgfx_cache_word <= sd_addr;
+        cgfx_cache_data <= sd_dout;
+      end
     end
-  end
+  end else begin : g_cache_table
+    localparam int LINES = 1 << CGFX_CACHE_BITS;
+    localparam int TAG_W = SD_AW - CGFX_CACHE_BITS;
+    // No reset on RAM data or output: keep the table a synchronous memory.
+    // Invalid entries are masked by a separate resettable bitmap.
+    // A same-index fill suppresses lookup_present/lookup_valid below, so the
+    // read result on that edge is unobservable. Do not require old-data RAM
+    // collision behavior or add read-during-write emulation logic.
+    (* ramstyle = "M10K, no_rw_check" *) logic [TAG_W+15:0] line_ram [0:LINES-1];
+    logic [LINES-1:0] valid_bits;
+    logic [TAG_W+15:0] lookup_line;
+    logic [SD_AW-1:0] lookup_word;
+    logic lookup_present, lookup_valid;
+    wire [CGFX_CACHE_BITS-1:0] lookup_index = cgfx_word[CGFX_CACHE_BITS-1:0];
+    wire [CGFX_CACHE_BITS-1:0] fill_index = sd_addr[CGFX_CACHE_BITS-1:0];
+    wire fill = sd_ack && (gnt == G_CGFX);
+    wire lookup_fill_collision = fill && (lookup_index == fill_index);
+    assign alias_cache_write = iol_wr; // Conservatively invalidate all ROM/GFX.
+    assign cgfx_lookup_ready = lookup_present && (lookup_word == cgfx_word) && !iol_wr;
+    assign cgfx_cache_hit = cgfx_lookup_ready && lookup_valid &&
+                           (lookup_line[TAG_W+15:16] == cgfx_word[SD_AW-1:CGFX_CACHE_BITS]);
+    assign cgfx_cache_byte = cgfx_bsel ? lookup_line[15:8] : lookup_line[7:0];
+    always_ff @(posedge clk) begin
+      lookup_line <= line_ram[lookup_index];
+      if (fill && !rst)
+        line_ram[fill_index] <= {sd_addr[SD_AW-1:CGFX_CACHE_BITS], sd_dout};
+      if (rst) begin
+        valid_bits <= '0;
+        lookup_present <= 1'b0;
+        lookup_valid <= 1'b0;
+        lookup_word <= '0;
+      end else begin
+        lookup_word <= cgfx_word;
+        // Suppress any ambiguous RAM read-during-write. A following clean
+        // synchronous lookup sees both the new data and the new valid bit.
+        lookup_present <= !iol_wr && !lookup_fill_collision;
+        lookup_valid <= valid_bits[lookup_index] && !iol_wr && !lookup_fill_collision;
+        if (iol_wr) valid_bits <= '0;
+        else if (fill) valid_bits[fill_index] <= 1'b1;
+      end
+    end
+  end endgenerate
 
   // route the granted requester to the physical port; return ack/data to it only.
   logic cgfx_bsel_q, src_bsel_q;   // (decl before use: Questa/Quartus need decl-before-use)

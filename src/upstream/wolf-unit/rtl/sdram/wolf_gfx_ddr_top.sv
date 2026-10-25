@@ -69,6 +69,9 @@
 module wolf_gfx_ddr_top #(
     parameter [28:0] GFX_DDR_BASE = 29'h6800000,
     parameter bit USE_STREAM_HINT = 1'b0,
+    // Private experiment: opt in only after validating the Pocket PSRAM
+    // backend. Default1 retains the cabinet-proven donor transaction shape.
+    parameter integer STREAM_BURST_BEATS = 1,
 `ifdef POCKET
     parameter bit DIRECT_PREFETCH = 1'b1
 `else
@@ -221,6 +224,10 @@ module wolf_gfx_ddr_top #(
     // runway lets the owner issue the next single beat before the DMA consumes
     // the preceding line, so a short DCS grant cannot turn every line crossing
     // into a demand stall.
+    // STREAM_BURST_BEATS=4 is the Pocket experiment's explicit exception:
+    // demand/CPU/download accesses remain one beat, while dense source runs
+    // prefetch up to one aligned 32-byte block. The four existing cache slots
+    // hold its completed responses; there is no additional data RAM.
     localparam integer PF_DEPTH = 4;
     logic [PF_DEPTH-1:0] pf_valid;
     logic [21:0] pf_tag [0:PF_DEPTH-1];
@@ -228,6 +235,9 @@ module wolf_gfx_ddr_top #(
     logic [21:0] pf_target;
     logic [2:0]  pf_left;
     logic [2:0]  pf_goal;
+    logic [2:0]  pf_burst_len;
+    logic [2:0]  pf_burst_left;
+    logic [21:0] pf_burst_base;
     // Keep the DMA and CPU demand lines independent.  Open Ice reads graphics
     // metadata through cgfx while the DMA is consuming long, sequential rink
     // spans.  A shared demand line lets each CPU miss evict the DMA's current
@@ -395,7 +405,8 @@ module wolf_gfx_ddr_top #(
     logic [3:0]  ost;
     logic        o_is_src;        // which read port owns the in-flight line fill
     logic        o_done_pend;     // fill finished; pulse done from O_GAP (see O_RWAIT)
-    // SRC next-line PREFETCH (fill-path only — the serve pipeline + single-beat fill shape are
+    // SRC next-line PREFETCH (the default preserves the serve pipeline + single-beat fill shape).
+    // Original donor rationale:
     // UNCHANGED, so none of the 3 documented cab-death modes are touched: no burst fill, no serve
     // collapse, no address-guard change). After a src line fills, read the NEXT sequential line into
     // a 1-beat buffer in the background (lowest arb priority). A src miss for that line then PROMOTES
@@ -420,6 +431,13 @@ module wolf_gfx_ddr_top #(
     wire src_live_miss_w = src_req && !src_hit && !src_pf_hit;
     wire cg_live_miss_w  = cg_req && !cg_hit;
     wire stream_prefetch_w = USE_STREAM_HINT && src_stream;
+    // End each speculative burst at an aligned four-beat boundary. Besides
+    // keeping physical runs inside their 32-word rows, this prevents a burst
+    // at the 32-MiB graphics aperture end from entering the sound aperture.
+    wire [2:0] pf_until_boundary_w = 3'd4 - {1'b0, pf_target[1:0]};
+    wire [2:0] pf_issue_len_w = (STREAM_BURST_BEATS == 4 && stream_prefetch_w)
+        ? pf_until_boundary_w
+        : 3'd1;
     logic       pf_pend_hit_w;
     logic [1:0] pf_pend_slot_w;
     logic [2:0] pf_valid_count_w;
@@ -519,6 +537,7 @@ module wolf_gfx_ddr_top #(
             wl_beat <= 22'd0; wl_mask <= 8'd0; wl_data <= 64'd0;
             fwd_valid <= 1'b0; fwd_beat <= 22'd0; fwd_data <= 64'd0;
             pf_valid <= '0; pf_target <= 22'd0; pf_left <= 3'd0; pf_goal <= 3'd1;
+            pf_burst_len <= 3'd1; pf_burst_left <= 3'd1; pf_burst_base <= 22'd0;
             for (int p = 0; p < PF_DEPTH; p++) begin
                 pf_tag[p] <= 22'd0;
                 pf_data[p] <= 64'd0;
@@ -532,6 +551,12 @@ module wolf_gfx_ddr_top #(
             tst_wr_req <= 1'b0;
             src_done <= 1'b0;
             cg_done  <= 1'b0;
+            // A demand caught by an early response may resume while the
+            // remaining beats still drain under this same owner.
+            if (o_done_pend && ost == O_PWAIT) begin
+                src_done <= 1'b1;
+                o_done_pend <= 1'b0;
+            end
             case (ost)
                 O_IDLE: begin
                     if (wflush_req) begin   // wr_taking: snapshot the buffer this edge
@@ -556,7 +581,9 @@ module wolf_gfx_ddr_top #(
                     // eventual done then serves the NEXT request from the WRONG line
                     // (found via tb_cg_probe: every post-first cg fill served the previous
                     // line's byte; the e2e gate caught it as 100% cg mismatches).
-                    else if (src_pf_served && pf_valid[src_pf_served_slot]) begin
+                    else if (src_pf_served && pf_valid[src_pf_served_slot] &&
+                             (!(STREAM_BURST_BEATS == 4 && stream_prefetch_w) ||
+                              src_pf_served_slot == 2'd3)) begin
                         // The front-end served a prefetched line on the
                         // preceding edge. Promote it, retain the other future
                         // lines, and refill the one consumed slot. A jump into
@@ -565,7 +592,15 @@ module wolf_gfx_ddr_top #(
                         src_line_data <= (DIRECT_PREFETCH ? pf_promote_data_w : pf_data[src_pf_served_slot]);
                         src_line_valid <= 1'b1;
                         src_line_tag <= (DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[src_pf_served_slot]);
-                        if (src_line_valid &&
+                        if (STREAM_BURST_BEATS == 4 && stream_prefetch_w) begin
+                            // Once the final line of this aligned block is
+                            // consumed, keep that line in the demand register
+                            // and fetch the next block while it is consumed.
+                            pf_valid <= '0;
+                            pf_target <= pf_promote_tag_w + 22'd1;
+                            pf_left <= 3'd4;
+                            pf_goal <= 3'd4;
+                        end else if (src_line_valid &&
                             ((DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[src_pf_served_slot]) == (src_line_tag + 22'd1))) begin
                             pf_valid[src_pf_served_slot] <= 1'b0;
                             pf_goal <= pf_next_goal_w;
@@ -583,7 +618,14 @@ module wolf_gfx_ddr_top #(
                             src_line_data <= (DIRECT_PREFETCH ? pf_promote_data_w : pf_data[pf_pend_slot_w]);
                             src_line_valid <= 1'b1;
                             src_line_tag <= (DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[pf_pend_slot_w]);
-                            if (src_line_valid &&
+                            if (STREAM_BURST_BEATS == 4 && stream_prefetch_w) begin
+                                // A completed aligned block stays resident
+                                // until the next demand miss. In particular,
+                                // serving it during an outstanding burst must
+                                // not rewind the next target or evict an unread
+                                // member of the same block.
+                                pf_valid[pf_pend_slot_w] <= 1'b0;
+                            end else if (src_line_valid &&
                                 ((DIRECT_PREFETCH ? pf_promote_tag_w : pf_tag[pf_pend_slot_w]) == (src_line_tag + 22'd1))) begin
                                 pf_valid[pf_pend_slot_w] <= 1'b0;
                                 pf_goal <= pf_next_goal_w;
@@ -602,8 +644,8 @@ module wolf_gfx_ddr_top #(
                         o_line <= cg_addr[24:3];
                         ost <= O_RISSUE;
                     end
-                    // Lowest priority: extend the sequential runway. Each
-                    // transaction remains exactly one 8-byte Avalon read.
+                    // Lowest priority: extend the sequential runway. The
+                    // optional dense Pocket path coalesces one aligned block.
                     else if ((pf_left != 3'd0) && !src_live_miss_w &&
                              !(cg_live_miss_w && cg_safe_w))
                         ost <= O_PISSUE;
@@ -667,9 +709,19 @@ module wolf_gfx_ddr_top #(
                     end
                     ost <= O_IDLE;
                 end
-                // background next-line prefetch: ONE single-beat read into the pf buffer (no done
-                // pulse — it serves no requester; the eventual PROMOTE in O_IDLE does the serve).
+                // Background prefetch holds ownership through all responses.
+                // A demand for a returned beat can resume before the tail;
+                // other requesters cannot acquire the agent before the tail.
                 O_PISSUE: begin
+                    // Capture the speculative descriptor in this state even
+                    // when arbitration cancels the issue below. Cancelled
+                    // values are unused: no request is emitted and O_PWAIT is
+                    // never entered. This keeps the live miss/download-flush
+                    // cone out of the descriptor/counter register enables,
+                    // without adding a cycle or changing command priority.
+                    pf_burst_base <= pf_target;
+                    pf_burst_len <= pf_issue_len_w;
+                    pf_burst_left <= pf_issue_len_w;
                     // A request can arrive after O_IDLE selected prefetch but
                     // before the DDR command is issued. Yield without traffic.
                     if (wflush_req || src_pend || src_live_miss_w ||
@@ -691,20 +743,30 @@ module wolf_gfx_ddr_top #(
                         src_line_data <= tst_rdata;
                         src_line_valid <= 1'b1;
                         src_line_tag <= pf_target;
-                        pf_valid <= '0;
                         pf_target <= pf_target + 22'd1;
-                        pf_left <= 3'd1;
-                        pf_goal <= 3'd1;
                         o_is_src <= 1'b1;
                         o_done_pend <= 1'b1;
-                        ost <= O_GAP;
+                        if (pf_burst_len == 3'd1) begin
+                            pf_valid <= '0;
+                            pf_left <= 3'd1;
+                            pf_goal <= 3'd1;
+                            ost <= O_GAP;
+                        end else begin
+                            if (pf_left != 3'd0) pf_left <= pf_left - 3'd1;
+                            pf_burst_left <= pf_burst_left - 3'd1;
+                            if (pf_burst_left == 3'd1) ost <= O_GAP;
+                        end
                     end else begin
                         pf_data[pf_target[1:0]] <= tst_rdata;
                         pf_tag[pf_target[1:0]] <= pf_target;
                         pf_valid[pf_target[1:0]] <= 1'b1;
                         pf_target <= pf_target + 22'd1;
                         if (pf_left != 3'd0) pf_left <= pf_left - 3'd1;
-                        ost <= O_IDLE;
+                        // A fresh demand not registered at this response uses
+                        // normal O_IDLE promotion after the burst completes.
+                        // Requester reset does not discard any bus response.
+                        pf_burst_left <= pf_burst_left - 3'd1;
+                        if (pf_burst_left == 3'd1) ost <= O_IDLE;
                     end
                 end
                 default: ost <= O_IDLE;
@@ -712,12 +774,13 @@ module wolf_gfx_ddr_top #(
         end
     end
 
-    // agent request mux: flush states target the latched beat; line fills read the line's
-    // beat. EVERYTHING is single-beat (burstcnt pinned 1) — see the line-size cab lesson.
+    // The prefetch base and length stay stable through the complete agent
+    // transaction; pf_target independently advances to tag each response.
+    // Demand, CPU and download transactions always retain their single beat.
     wire fsel = (ost == O_FRD) || (ost == O_FRDW) || (ost == O_FWR) || (ost == O_FWW);
     wire psel = (ost == O_PISSUE) || (ost == O_PWAIT);
-    assign tst_addr     = fsel ? {4'd0, wl_beat} : psel ? {4'd0, pf_target} : {4'd0, o_line};
-    assign tst_burstcnt = 8'd1;
+    assign tst_addr     = fsel ? {4'd0, wl_beat} : psel ? {4'd0, pf_burst_base} : {4'd0, o_line};
+    assign tst_burstcnt = psel ? {5'd0, pf_burst_len} : 8'd1;
     assign tst_wdata    = wl_data;
     assign dl_idle      = !wc_valid && (ost == O_IDLE) && !tst_busy
                         && !tst_rd_req && !tst_wr_req;

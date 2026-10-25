@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """Create the ROM-free Pocket installation ZIP from an explicit file list."""
+import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -39,13 +40,22 @@ def release_files():
 
 
 def main():
-    version = json.loads((ROOT / 'pocket' / CORE / 'core.json').read_text())['core']['metadata']['version']
+    manifest = json.loads((ROOT / 'source-manifest.json').read_text())
+    if manifest.get('release_ready') is False:
+        raise SystemExit(
+            'Release packaging is disabled for this development snapshot: '
+            'the preserved bitstream does not correspond to the modified sources. '
+            'Build and validate a matching FPGA image before enabling packaging.'
+        )
+    metadata = json.loads((ROOT / 'pocket' / CORE / 'core.json').read_text())['core']['metadata']
+    version = metadata['version']
+    release_date = datetime.date.fromisoformat(metadata['date_release'])
     destination = ROOT / 'dist' / f'auricom79.OpenIce_{version}.zip'
     destination.parent.mkdir(exist_ok=True)
     files = release_files()
     with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name, raw in sorted(files.items()):
-            info = zipfile.ZipInfo(name, date_time=(2026, 10, 20, 0, 0, 0))
+            info = zipfile.ZipInfo(name, date_time=(release_date.year, release_date.month, release_date.day, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o100644 << 16
             archive.writestr(info, raw)

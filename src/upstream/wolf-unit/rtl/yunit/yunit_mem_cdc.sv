@@ -104,7 +104,11 @@ endmodule
 // Wolf's CPU and memsys now share one physical clock. This adapter preserves
 // the same request/ack contract without crossing toggles through synchronizers.
 module yunit_mem_sameclock #(
-  parameter AW = 32, parameter DW = 32, parameter SW = 6
+  parameter AW = 32, parameter DW = 32, parameter SW = 6,
+  // After the CPU consumes ACK, its next request is stable for the full
+  // following CE interval. The old extra SC_COOL interval is unnecessary
+  // for a synchronous CPU. Keep the legacy default for other users.
+  parameter bit FAST_BACK_TO_BACK = 1'b0
 )(
   input  logic          clk_cpu,
   input  logic          ce_cpu,
@@ -162,7 +166,11 @@ module yunit_mem_sameclock #(
         end
         SC_RESP: if (ce_cpu !== 1'b0) begin
           c_ack <= 1'b0;
-          scst  <= SC_COOL;
+          // Do not capture a new payload on this edge: the CPU consumes the
+          // old response here and updates its request after the edge. SC_IDLE
+          // can accept it only at the NEXT CE, preserving the full CE/4
+          // launch-to-capture interval used by the Pocket timing constraints.
+          scst  <= FAST_BACK_TO_BACK ? SC_IDLE : SC_COOL;
         end
         SC_COOL: if (ce_cpu !== 1'b0) scst <= SC_IDLE;
         default: scst <= SC_IDLE;
